@@ -1,0 +1,27 @@
+name: Verify classroom
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env: {POSTGRES_USER: studio, POSTGRES_PASSWORD: test-only, POSTGRES_DB: studio}
+        ports: ['5432:5432']
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PASSWORD: test-only
+      DJANGO_DEBUG: '1'
+      MESHY_MODE: demo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12', cache: pip}
+      - run: pip install -r requirements.lock
+      - run: python manage.py makemigrations --check --dry-run
+      - run: python manage.py test
+      - run: python manage.py collectstatic --noinput

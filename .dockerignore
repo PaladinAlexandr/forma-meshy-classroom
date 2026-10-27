@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+!.env.*.example
+backups
+forma-root.crt
+student-access
+.git
+.venv
+__pycache__
+*.sqlite3
+media
+staticfiles
+*.zip

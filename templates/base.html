@@ -1,0 +1,38 @@
+{% load static %}<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Мастерская{% endblock %} · FORMA</title>
+<link rel="icon" type="image/svg+xml" href="{% static 'brand.svg' %}"><link rel="stylesheet" href="{% static 'app.css' %}">
+<script src="{% static 'app.js' %}" defer></script>{% block head %}{% endblock %}</head>
+<body data-auth="{% if user.is_authenticated %}1{% else %}0{% endif %}" data-auto="{% if not teacher %}1{% else %}0{% endif %}">
+{% include 'icons.html' %}
+{% if user.is_authenticated %}
+<a class="skip" href="#main">Перейти к содержимому</a>
+<aside class="sidebar">
+  <a href="{% url 'dashboard' %}" class="brand"><img src="{% static 'brand.svg' %}" alt="" width="35" height="35"><span>FORMA<small>учебная 3D-мастерская</small></span></a>
+  <div class="workspace-label">{% if teacher %}КАБИНЕТ ПРЕПОДАВАТЕЛЯ{% else %}ТВОЯ МАСТЕРСКАЯ{% endif %}</div>
+  <nav aria-label="Главное меню">
+    <a class="nav-link {% if request.resolver_match.url_name == 'dashboard' or request.resolver_match.url_name == 'detail' %}selected{% endif %}" href="{% url 'dashboard' %}"><svg><use href="#i-grid"/></svg>{% if teacher %}Заявки учеников{% else %}Мои проекты{% endif %}</a>
+    {% if teacher %}
+    <a class="nav-link {% if request.resolver_match.url_name == 'students' %}selected{% endif %}" href="{% url 'students' %}"><svg><use href="#i-users"/></svg>Ученики</a>
+    <a class="nav-link {% if request.resolver_match.url_name == 'settings' %}selected{% endif %}" href="{% url 'settings' %}"><svg><use href="#i-settings"/></svg>Настройки центра</a>
+    {% else %}
+    <a class="nav-link {% if request.resolver_match.url_name == 'new' %}selected{% endif %}" href="{% url 'new' %}"><svg><use href="#i-plus"/></svg>Создать заявку</a>
+    <a class="nav-link" href="{% url 'dashboard' %}?status=ready"><svg><use href="#i-cube"/></svg>Готовые модели</a>
+    {% endif %}
+  </nav>
+  <div class="sidebar-note"><span class="tiny-label">ОТ ИДЕИ ДО ОБЪЁМА</span><div class="flow-mini"><span>01 Фото</span><span>02 Проверка</span><span>03 Модель ↗</span></div><p>Маленькие шаги.<br>Большие открытия.</p></div>
+  <div class="sidebar-bottom"><div class="connection"><i></i>{% if demo_mode %}Демонстрационный режим{% else %}Общий аккаунт Meshy{% endif %}</div><a href="{% url 'password_change' %}">Сменить пароль <span>↗</span></a><form action="{% url 'logout' %}" method="post">{% csrf_token %}<button class="logout">Выйти из мастерской <span>↗</span></button></form></div>
+</aside>
+<div class="app-shell">
+<header class="topbar"><span class="breadcrumb">Мастерская <span>/</span> {% block crumb %}Обзор{% endblock %}</span><div class="user-meta"><span class="date">{% now "j E Y" %}</span><span class="avatar">{{ user.first_name|default:user.username|slice:':1'|upper }}</span><div><strong>{{ user.first_name|default:user.username }}</strong><small>{% if teacher %}Преподаватель{% else %}Исследователь 3D{% endif %}</small></div></div></header>
+<main id="main" class="main">
+{% if demo_mode %}<div class="demo-strip"><span>DEMO</span> Здесь можно пройти весь путь заявки. Генерация учебная, кредиты Meshy не расходуются.</div>{% endif %}
+{% for message in messages %}<div class="message {{ message.tags }}" role="status">{{ message }}</div>{% endfor %}
+<div id="live-update" class="message live-message" hidden role="status">Статус заявки изменился. <button class="text-link" data-refresh>Обновить страницу ↻</button></div>
+{% block content %}{% endblock %}
+<footer class="footer"><span>FORMA · Пространство, где идеи обретают форму</span><span>Создаём с Meshy AI <svg><use href="#i-spark"/></svg></span></footer>
+</main></div>
+{% else %}
+{% block anonymous %}{% endblock %}
+{% endif %}
+</body></html>

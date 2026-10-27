@@ -1,0 +1,83 @@
+# Standalone local Docker Desktop configuration. Do not combine with compose.yaml.
+# Published only on this computer. The public-domain deployment uses compose.yaml.
+name: forma-local
+
+x-app: &app
+  build: .
+  environment:
+    DJANGO_DEBUG: '1'
+    DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-local-development-only-change-before-deploying}
+    DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1
+    CSRF_TRUSTED_ORIGINS: http://localhost:8010,http://127.0.0.1:8010
+    TRUST_PROXY_HEADERS: '0'
+    POSTGRES_HOST: db
+    POSTGRES_DB: ${POSTGRES_DB:-studio}
+    POSTGRES_USER: ${POSTGRES_USER:-studio}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-demo-password}
+    REDIS_URL: redis://redis:6379/0
+    MEDIA_ROOT: /app/media
+    APP_TIME_ZONE: ${APP_TIME_ZONE:-Asia/Yekaterinburg}
+    MESHY_MODE: ${MESHY_MODE:-demo}
+    MESHY_API_KEY: ${MESHY_API_KEY:-}
+    MESHY_AI_MODEL: ${MESHY_AI_MODEL:-meshy-7.1}
+    MESHY_IMAGE_MODEL: ${MESHY_IMAGE_MODEL:-nano-banana}
+    MESHY_ASSET_HOSTS: ${MESHY_ASSET_HOSTS:-assets.meshy.ai}
+  volumes:
+    - media:/app/media
+  restart: unless-stopped
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-studio}
+      POSTGRES_USER: ${POSTGRES_USER:-studio}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-demo-password}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  web:
+    <<: *app
+    ports:
+      - '127.0.0.1:8010:8000'
+    command: sh -c 'python manage.py migrate --noinput && python manage.py bootstrap && python manage.py collectstatic --noinput && gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 2 --timeout 120 --access-logfile -'
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: ['CMD', 'python', '-c', "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/', timeout=5)"]
+      interval: 5s
+      timeout: 8s
+      start_period: 60s
+      retries: 24
+  worker:
+    <<: *app
+    command: celery -A config worker --loglevel=INFO --concurrency=2
+    depends_on:
+      web: {condition: service_healthy}
+  beat:
+    <<: *app
+    command: celery -A config beat --loglevel=INFO --schedule=/tmp/celerybeat-schedule
+    depends_on:
+      web: {condition: service_healthy}
+
+volumes:
+  pgdata:
+  redisdata:
+  media:

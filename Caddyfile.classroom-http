@@ -1,0 +1,9 @@
+:8010 {
+    encode gzip zstd
+    request_body { max_size 12MB }
+    header {
+        -Server
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    }
+    reverse_proxy web:8000
+}

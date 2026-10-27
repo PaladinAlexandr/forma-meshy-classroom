@@ -1,0 +1,97 @@
+# Standalone LAN deployment for a Windows Docker Desktop host.
+# Use forma.cmd; it selects .env.classroom and this file consistently.
+# Separate data volumes from the old forma-local demo project.
+name: forma-classroom
+
+x-app: &app
+  build: .
+  environment:
+    DJANGO_DEBUG: '0'
+    DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in .env.classroom}
+    DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1,${CLASSROOM_HOST:?Set CLASSROOM_HOST to the LAN IPv4 address}
+    CSRF_TRUSTED_ORIGINS: https://${CLASSROOM_HOST}:8443
+    TRUST_PROXY_HEADERS: '1'
+    POSTGRES_HOST: db
+    POSTGRES_DB: studio
+    POSTGRES_USER: studio
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.classroom}
+    REDIS_URL: redis://redis:6379/0
+    MEDIA_ROOT: /app/media
+    APP_TIME_ZONE: ${APP_TIME_ZONE:-Asia/Yekaterinburg}
+    MESHY_MODE: ${MESHY_MODE:-demo}
+    MESHY_API_KEY: ${MESHY_API_KEY:-}
+    MESHY_AI_MODEL: ${MESHY_AI_MODEL:-meshy-7.1}
+    MESHY_IMAGE_MODEL: ${MESHY_IMAGE_MODEL:-nano-banana}
+    MESHY_ASSET_HOSTS: ${MESHY_ASSET_HOSTS:-assets.meshy.ai}
+  volumes:
+    - media:/app/media
+  restart: unless-stopped
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: studio
+      POSTGRES_USER: studio
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.classroom}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  web:
+    <<: *app
+    command: sh -c 'python manage.py migrate --noinput && python manage.py bootstrap && python manage.py collectstatic --noinput && gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 2 --timeout 120 --access-logfile -'
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: ['CMD', 'python', '-c', "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8000/health/', headers={'Host':'${CLASSROOM_HOST}', 'X-Forwarded-Proto':'https'}), timeout=5)"]
+      interval: 5s
+      timeout: 8s
+      start_period: 60s
+      retries: 24
+  worker:
+    <<: *app
+    command: celery -A config worker --loglevel=INFO --concurrency=2
+    depends_on:
+      web: {condition: service_healthy}
+  beat:
+    <<: *app
+    command: celery -A config beat --loglevel=INFO --schedule=/tmp/celerybeat-schedule
+    depends_on:
+      web: {condition: service_healthy}
+  proxy:
+    image: caddy:2-alpine
+    environment:
+      CLASSROOM_HOST: ${CLASSROOM_HOST:?Set CLASSROOM_HOST in .env.classroom}
+    ports:
+      - '${CLASSROOM_HOST}:8443:8443'
+    volumes:
+      - ./Caddyfile.classroom:/etc/caddy/Caddyfile:ro
+      - caddydata:/data
+      - caddyconfig:/config
+    depends_on:
+      web: {condition: service_healthy}
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
+  media:
+  caddydata:
+  caddyconfig:

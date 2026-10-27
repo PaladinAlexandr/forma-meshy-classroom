@@ -1,0 +1,27 @@
+.env
+.env.*
+!.env.example
+!.env.*.example
+backups/
+forma-root.crt
+student-access/
+.venv/
+__pycache__/
+*.pyc
+*.sqlite3
+media/
+staticfiles/
+.coverage
+celerybeat-schedule*
+
+# Generated exports, local tools and secrets
+*.zip
+*.log
+*.dump
+*.bak
+*.pem
+*.key
+*.pfx
+*.p12
+node_modules/
+.pytest_cache/

@@ -1,0 +1,16 @@
+{
+    auto_https disable_redirects
+}
+
+{$CLASSROOM_HOST}:8443 {
+    tls internal
+    encode gzip zstd
+    request_body {
+        max_size 12MB
+    }
+    header {
+        -Server
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    }
+    reverse_proxy web:8000
+}
