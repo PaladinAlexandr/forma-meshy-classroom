@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Preset, Policy, Request, Event
+from .models import Preset, Policy, Request, Event, AnimationAsset
 
 admin.site.site_header = 'FORMA · Администрация центра'
 admin.site.site_title = 'FORMA'
@@ -35,6 +35,18 @@ class RequestAdmin(admin.ModelAdmin):
 class EventAdmin(admin.ModelAdmin):
     list_display = ['request', 'text', 'created_at']
     readonly_fields = ['request', 'actor', 'text', 'created_at']
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(AnimationAsset)
+class AnimationAssetAdmin(admin.ModelAdmin):
+    list_display = ['request', 'names', 'ready', 'created_at']
+    readonly_fields = [f.name for f in AnimationAsset._meta.fields]
 
     def has_add_permission(self, request):
         return False

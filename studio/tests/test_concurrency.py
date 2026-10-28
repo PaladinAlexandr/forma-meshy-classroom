@@ -69,3 +69,45 @@ class ConcurrencyTests(TransactionTestCase):
             provider.return_value.submit.assert_called_once()
         self.assertEqual(Request.objects.filter(status='running').count(), 10)
         self.assertEqual(Request.objects.filter(status='approved').count(), 1)
+
+    def test_new_model_and_animation_cannot_claim_same_student_simultaneously(self):
+        import tempfile
+        from studio.animations import request_animation
+        original = Request.objects.create(student=self.student, title='Ready humanoid',
+            preset=self.preset, preset_name='Clay', prompt_snapshot='Clay', status='ready',
+            model_kind='humanoid', model_fbx='unused.fbx', model_glb='unused.glb',
+            provider_mode='live', provider_task_id='original-model-task')
+        def animate():
+            try:
+                request_animation(original.pk, get_user_model().objects.get(pk=self.student.pk), ['walk'])
+                return 'created'
+            except ValidationError:
+                return 'blocked'
+        def create():
+            form = RequestForm({'title': 'Another model', 'preset': self.preset.pk, 'consent': True}, {'image': photo()})
+            assert form.is_valid(), form.errors
+            try:
+                create_request(get_user_model().objects.get(pk=self.student.pk), form)
+                return 'created'
+            except ValidationError:
+                return 'blocked'
+        with tempfile.TemporaryDirectory() as media, override_settings(MEDIA_ROOT=media):
+            self.assertCountEqual(self.simultaneous([animate, create]), ['created', 'blocked'])
+        self.assertEqual(Request.objects.filter(student=self.student, status='pending').count(), 1)
+
+    def test_mixed_animation_and_model_workers_share_last_slot(self):
+        from studio.tasks import claim
+        for index in range(9):
+            owner = get_user_model().objects.create_user(username=f'mixed-{index}')
+            Request.objects.create(student=owner, title='Active', preset=self.preset,
+                preset_name='Clay', prompt_snapshot='Clay', status='running',
+                generation_stage='animation' if index % 2 else 'model')
+        candidates = []
+        for index, stage in enumerate(('rig', 'model')):
+            owner = get_user_model().objects.create_user(username=f'candidate-{index}')
+            candidates.append(Request.objects.create(student=owner, title='Candidate', preset=self.preset,
+                preset_name='Clay', prompt_snapshot='Clay', status='approved', reviewed_at=timezone.now(),
+                generation_stage=stage, model_kind='humanoid'))
+        results = self.simultaneous([lambda: claim(candidates[0].pk), lambda: claim(candidates[1].pk)])
+        self.assertEqual(sum(result is not None for result in results), 1)
+        self.assertEqual(Request.objects.filter(status__in=['running', 'submitting']).count(), 10)

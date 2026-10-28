@@ -57,11 +57,20 @@ class Request(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     student = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='model_requests')
     title = models.CharField('Название модели', max_length=100)
+    model_kind = models.CharField('Тип модели', max_length=10, default='object', choices=[
+        ('humanoid', 'Гуманоид'), ('animal', 'Животное'), ('object', 'Предмет')])
     note = models.TextField('Идея', max_length=600, blank=True)
     image = models.ImageField('Фото', upload_to=upload_path, blank=True)
     source = models.CharField('Начать с', max_length=8, choices=[('photo', 'Фото или рисунок'), ('text', 'Текст → изображение → 3D')], default='photo')
     text_prompt = models.TextField('Твой промпт', max_length=800, blank=True)
-    generation_stage = models.CharField(max_length=8, choices=[('image', 'Изображение'), ('model', '3D-модель')], default='model')
+    generation_stage = models.CharField(max_length=10, choices=[('image', 'Изображение'), ('model', '3D-модель'),
+        ('rig', 'Скелет персонажа'), ('animation', 'Анимация')], default='model')
+    model_task_id = models.CharField(max_length=100, blank=True, null=True, unique=True)
+    rig_task_id = models.CharField(max_length=100, blank=True, null=True, unique=True)
+    rigged_fbx = models.FileField(upload_to=upload_path, blank=True)
+    rig_credits = models.PositiveIntegerField(null=True, blank=True)
+    animation_job_id = models.UUIDField(null=True, blank=True)
+    animation_actions = models.JSONField(default=list, blank=True)
     image_task_id = models.CharField(max_length=100, blank=True, null=True, unique=True)
     image_model = models.CharField(max_length=40, blank=True)
     image_credits = models.PositiveIntegerField(null=True, blank=True)
@@ -103,12 +112,27 @@ class Request(models.Model):
 
     @property
     def status_label(self):
+        if self.is_animation:
+            return {'pending': 'Анимация на проверке', 'approved': 'Анимация · в очереди',
+                    'submitting': 'Отправляем анимацию в Meshy',
+                    'running': 'Создаётся скелет' if self.generation_stage == 'rig' else 'Создаётся анимация',
+                    'saving': 'Сохраняем анимацию', 'ready': 'Модель и анимация готовы',
+                    'rejected': 'Анимация отклонена', 'failed': 'Ошибка анимации'}.get(self.status, self.get_status_display())
         if self.generation_stage == 'image':
             return {'pending': 'Промпт на проверке', 'approved': 'Изображение · в очереди',
                     'running': 'Создаётся изображение', 'saving': 'Сохраняем изображение'}.get(self.status, self.get_status_display())
         if self.source == 'text' and self.status == 'pending':
             return 'Изображение на проверке · перед 3D'
         return self.get_status_display()
+
+    @property
+    def is_animation(self):
+        return self.generation_stage in ('rig', 'animation')
+
+    @property
+    def animation_names(self):
+        from .animations import ACTIONS
+        return ', '.join(ACTIONS[key]['label'] for key in self.animation_actions if key in ACTIONS)
 
     @property
     def short_id(self):
@@ -130,3 +154,20 @@ class Event(models.Model):
 
     class Meta:
         ordering = ['created_at']
+
+
+class AnimationAsset(models.Model):
+    """Archived results remain downloadable when another animation is requested."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    request = models.ForeignKey(Request, on_delete=models.CASCADE, related_name='animations')
+    names = models.CharField(max_length=300)
+    mode = models.CharField(max_length=8)
+    ready = models.BooleanField(default=False)
+    fbx = models.FileField(upload_to=upload_path, blank=True)
+    glb = models.FileField(upload_to=upload_path, blank=True)
+    unity_package = models.FileField(upload_to=upload_path, blank=True)
+    consumed_credits = models.PositiveIntegerField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']

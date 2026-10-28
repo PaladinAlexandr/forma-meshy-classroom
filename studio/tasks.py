@@ -59,7 +59,7 @@ def claim(pk):
             if Request.objects.filter(status__in=['submitting', 'running', 'saving', 'uncertain']).count() >= policy.max_parallel:
                 return None
             item.status = 'submitting'
-            if not item.image_task_id:
+            if not item.image_task_id and not item.is_animation:
                 item.provider_mode = settings.MESHY_MODE
             item.provider_model = settings.MESHY_AI_MODEL
             if item.generation_stage == 'image':
@@ -96,6 +96,10 @@ def process(pk):
             item.provider_task_id, item.status, item.progress = task_id, 'running', 5
             if item.generation_stage == 'image':
                 item.image_task_id = task_id
+            elif item.generation_stage == 'rig':
+                item.rig_task_id = task_id
+            elif item.generation_stage == 'model':
+                item.model_task_id = task_id
             item.error = ''
             event(item, 'Заявка принята Meshy. Началась генерация.' if item.provider_mode == 'live' else 'Началась демонстрационная генерация. Кредиты Meshy не используются.')
             item.next_poll_at = timezone.now() + timedelta(seconds=10)
@@ -108,6 +112,9 @@ def process(pk):
             if age < 30:
                 item.progress = min(95, max(10, int(age * 3)))
                 item.next_poll_at = timezone.now() + timedelta(seconds=5)
+            elif item.is_animation:
+                from .demo_animation import finish_demo_animation
+                finish_demo_animation(item)
             elif item.generation_stage == 'image':
                 if not item.image:
                     item.image.save('demo-image.jpg', ContentFile(demo_image()), save=False)
@@ -126,7 +133,13 @@ def process(pk):
             if result['status'] == 'SUCCEEDED':
                 item.status = 'saving'
                 item.save(update_fields=['status', 'updated_at'])
-                if item.generation_stage == 'image':
+                if item.generation_stage == 'rig':
+                    from .animations import finish_rig
+                    finish_rig(item, result)
+                elif item.generation_stage == 'animation':
+                    from .animations import archive_animation
+                    archive_animation(item, result)
+                elif item.generation_stage == 'image':
                     archive_image(item, result)
                     finish_image(item, result.get('consumed_credits'))
                 else:
@@ -134,7 +147,7 @@ def process(pk):
                     finish(item, result.get('consumed_credits'))
             elif result['status'] in ('FAILED', 'CANCELED'):
                 item.status = 'failed'
-                item.error = 'Meshy не смог выполнить генерацию. Преподаватель поможет подготовить новую заявку.'
+                item.error = ('Meshy не смог подготовить скелет или анимацию. Для риггинга нужен текстурированный гуманоид с чёткими руками и ногами в T/A-позе.' if item.is_animation else 'Meshy не смог выполнить генерацию. Преподаватель поможет подготовить новую заявку.')
                 item.finished_at = timezone.now()
                 event(item, item.error)
             else:

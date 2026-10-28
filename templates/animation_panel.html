@@ -1,0 +1,30 @@
+{% if item.model_kind == 'humanoid' and item.model_fbx %}
+<section class="panel animation-panel">
+  <span class="eyebrow">ОЖИВИ ПЕРСОНАЖА</span><h2>Анимация гуманоидов</h2>
+  {% if item.is_animation %}<p><strong>{{ item.animation_names }}</strong> · {{ item.status_label }}</p>{% endif %}
+  {% if can_animate %}
+    {% if not teacher %}
+    <p>Выбери от одного до трёх движений. Сначала преподаватель проверит заявку, затем Meshy подготовит скелет и анимацию.</p>
+    <form method="post" action="{% url 'animate' item.pk %}" class="stack">{% csrf_token %}
+      <fieldset class="animation-options"><legend>{{ animation_form.actions.label }}</legend>{{ animation_form.actions }}</fieldset>
+      <p class="field-hint">За скелет и каждое движение Meshy расходует кредиты. До завершения этапа новый проект будет недоступен.</p>
+      <button class="btn primary">Отправить анимацию на проверку →</button>
+    </form>
+    {% else %}<p class="muted">Ученик может выбрать движения и отправить отдельную заявку на одобрение.</p>{% endif %}
+  {% elif not item.is_animation %}<p class="muted">Выбор движений появится после готовности модели.</p>{% endif %}
+  <p class="field-hint">Для скелета нужны две чёткие руки и две ноги, текстура и T/A-поза. Meshy может отклонить неподходящего персонажа.</p>
+</section>
+{% endif %}
+{% for asset in animation_assets %}
+<section class="panel animation-result">
+  <span class="eyebrow">ГОТОВАЯ АНИМАЦИЯ · {{ asset.created_at|date:'d.m H:i' }}</span><h2>{{ asset.names }}</h2>
+  {% if asset.mode == 'demo' %}<p class="info-line">Демо: движение учебного кристалла, а не анимация твоего персонажа. Кредиты не расходуются.</p>{% endif %}
+  {% if asset.glb %}
+  <model-viewer id="animation-{{ asset.pk }}" src="{% url 'animation_file' asset.pk 'glb' %}" alt="Анимация: {{ asset.names }}" camera-controls autoplay shadow-intensity="1" touch-action="pan-y"></model-viewer>
+  <div class="field"><label for="clip-{{ asset.pk }}">Движение в просмотре</label><select id="clip-{{ asset.pk }}" data-animation-viewer="animation-{{ asset.pk }}" aria-label="Движение в просмотре"><option>Загружаем движения…</option></select></div>
+  {% endif %}
+  <div class="download-row"><a class="btn primary" href="{% url 'animation_file' asset.pk 'fbx' %}">FBX с анимацией ↓</a><a class="btn secondary" href="{% url 'animation_file' asset.pk 'unity' %}">Анимация + текстуры · ZIP ↓</a></div>
+  <p class="field-hint">В ZIP: анимированный FBX, архив исходной модели с текстурами и инструкция для Unity 6 URP.</p>
+  {% if asset.consumed_credits != None %}<p class="credit-note">Кредиты за движения: {{ asset.consumed_credits }} (скелет оплачивается отдельно).</p>{% endif %}
+</section>
+{% endfor %}

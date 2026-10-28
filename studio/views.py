@@ -104,8 +104,53 @@ def new_request(request):
 @login_required
 def detail(request, pk):
     item = get_object_or_404(visible_requests(request.user), pk=pk)
+    from .animations import AnimationForm
+    can_animate = (item.model_kind == 'humanoid' and item.model_fbx and
+        (item.status == 'ready' or (item.is_animation and item.status in ('rejected', 'failed'))))
     return render(request, 'detail.html', {'item': item, 'events': item.events.select_related('actor'),
+        'animation_form': AnimationForm(), 'can_animate': can_animate,
+        'animation_assets': item.animations.filter(ready=True),
         'review_form': ReviewForm(), 'can_review': is_teacher(request.user) and item.status == 'pending'})
+
+
+@login_required
+@require_POST
+def animate(request, pk):
+    from .animations import AnimationForm, request_animation
+    get_object_or_404(visible_requests(request.user), pk=pk, student=request.user)
+    form = AnimationForm(request.POST)
+    if form.is_valid():
+        try:
+            request_animation(pk, request.user, form.cleaned_data['actions'])
+            messages.success(request, 'Заявка на анимацию отправлена преподавателю.')
+        except ValidationError as exc:
+            messages.error(request, ' '.join(exc.messages))
+        except IntegrityError:
+            messages.error(request, 'У тебя уже есть незавершённый проект. Дождись его завершения.')
+    else:
+        messages.error(request, 'Выбери от одного до трёх движений из списка.')
+    return redirect('detail', pk=pk)
+
+
+@login_required
+def animation_file(request, pk, kind):
+    from .models import AnimationAsset
+    asset = get_object_or_404(AnimationAsset, pk=pk, ready=True, request__in=visible_requests(request.user))
+    fields = {'fbx': ('fbx', 'application/octet-stream', 'fbx'),
+              'glb': ('glb', 'model/gltf-binary', 'glb'),
+              'unity': ('unity_package', 'application/zip', 'zip')}
+    if kind not in fields:
+        raise Http404
+    field, mime, suffix = fields[kind]
+    value = getattr(asset, field)
+    if not value:
+        raise Http404
+    try:
+        file = value.open('rb')
+    except FileNotFoundError:
+        raise Http404
+    return FileResponse(file, content_type=mime, as_attachment=kind != 'glb',
+        filename=f'forma-animation-{asset.id.hex[:8]}.{suffix}')
 
 
 @teacher_required
@@ -144,7 +189,7 @@ def private_file(request, pk, kind):
     fields = {'image': ('image', 'image/jpeg'), 'glb': ('model_glb', 'model/gltf-binary'),
               'fbx': ('model_fbx', 'application/octet-stream'),
               'unity': ('unity_package', 'application/zip')}
-    if kind not in fields or (kind != 'image' and item.status != 'ready'):
+    if kind not in fields or (kind != 'image' and item.status != 'ready' and not item.is_animation):
         raise Http404
     field, mime = fields[kind]
     value = getattr(item, field)
@@ -239,6 +284,10 @@ def reconcile(request, pk):
             item.provider_task_id = task_id or None
             if task_id and item.generation_stage == 'image':
                 item.image_task_id = task_id
+            elif task_id and item.generation_stage == 'rig':
+                item.rig_task_id = task_id
+            elif task_id and item.generation_stage == 'model':
+                item.model_task_id = task_id
             item.status = 'running' if task_id else 'failed'
             item.error = '' if task_id else 'Преподаватель подтвердил, что задача не была создана. Можно подать новую заявку.'
             item.next_poll_at = None

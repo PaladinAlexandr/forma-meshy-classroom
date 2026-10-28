@@ -616,3 +616,249 @@ class WorkflowTests(TestCase):
             self.assertEqual(item.image_task_id, 'image-task-live')
             self.assertEqual(item.provider_task_id, 'model-task-live')
             self.assertEqual(item.consumed_credits, 23)
+
+    def ready_humanoid(self, mode='demo'):
+        from studio.provider import demo_fbx
+        item = self.item()
+        item.model_kind, item.status, item.provider_mode = 'humanoid', 'ready', mode
+        item.provider_task_id = item.model_task_id = f'model-{item.pk}'
+        item.first_approved_at = timezone.now()
+        item.consumed_credits = 20
+        item.model_glb.save('model.glb', ContentFile(demo_glb()), save=False)
+        item.model_fbx.save('model.fbx', ContentFile(demo_fbx()), save=False)
+        item.unity_package.save('model.zip', ContentFile(b'original-model-package'), save=False)
+        item.save()
+        return item
+
+    def animation_tick(self, item, finish=False):
+        values = {'next_poll_at': None, 'lease_until': None}
+        if finish:
+            values['submitted_at'] = timezone.now() - timedelta(seconds=40)
+        Request.objects.filter(pk=item.pk).update(**values)
+        process(str(item.pk)); item.refresh_from_db()
+
+    def test_model_kind_form_and_animal_object_have_no_animation(self):
+        from studio.animations import request_animation
+        for kind in ('animal', 'object'):
+            item = self.ready_humanoid()
+            item.model_kind = kind; item.save()
+            self.client.force_login(self.student)
+            response = self.client.get(reverse('detail', args=[item.pk]))
+            self.assertNotContains(response, 'name="actions"')
+            with self.assertRaises(ValidationError):
+                request_animation(item.pk, self.student, ['walk'])
+            item.delete()
+        form = self.make_form(model_kind='humanoid')
+        self.assertTrue(form.is_valid(), form.errors)
+        item = create_request(self.student, form)
+        self.assertEqual(item.model_kind, 'humanoid')
+        invalid = self.make_form(model_kind='unknown')
+        self.assertFalse(invalid.is_valid())
+        self.assertIn('model_kind', invalid.errors)
+
+    def test_animation_requires_ready_model_owner_and_valid_actions(self):
+        from studio.animations import AnimationForm, request_animation
+        item = self.item(); item.model_kind = 'humanoid'; item.save()
+        with self.assertRaises(ValidationError):
+            request_animation(item.pk, self.student, ['walk'])
+        item.delete(); item = self.ready_humanoid()
+        for actions in ([], ['walk', 'walk'], ['999'], ['walk', 'run', 'idle', 'jump']):
+            self.assertFalse(AnimationForm({'actions': actions}).is_valid())
+            with self.assertRaises(ValidationError):
+                request_animation(item.pk, self.student, actions)
+        self.client.force_login(self.other)
+        self.assertEqual(self.client.post(reverse('animate', args=[item.pk]), {'actions': ['walk']}).status_code, 404)
+        client = Client(enforce_csrf_checks=True); client.force_login(self.student)
+        self.assertEqual(client.post(reverse('animate', args=[item.pk]), {'actions': ['walk']}).status_code, 403)
+        self.client.force_login(self.student)
+        self.assertEqual(self.client.get(reverse('animate', args=[item.pk])).status_code, 405)
+
+    def test_animation_blocks_new_model_and_duplicate_submission(self):
+        from studio.animations import request_animation
+        item = self.ready_humanoid()
+        original_id = item.model_task_id
+        request_animation(item.pk, self.student, ['walk', 'idle'])
+        item.refresh_from_db()
+        self.assertEqual((item.status, item.generation_stage, item.provider_task_id), ('pending', 'rig', None))
+        self.assertEqual(item.model_task_id, original_id)
+        with self.assertRaises(ValidationError):
+            request_animation(item.pk, self.student, ['run'])
+        form = self.make_form(); self.assertTrue(form.is_valid())
+        with self.assertRaises(ValidationError):
+            create_request(self.student, form)
+        self.client.force_login(self.student)
+        self.assertContains(self.client.get('/new/'), 'Открыть мой проект')
+        with patch('studio.tasks.Meshy') as api:
+            process(str(item.pk)); api.return_value.submit.assert_not_called()
+        self.approve(item)
+        self.animation_tick(item)
+        self.assertEqual(item.provider_mode, 'demo')
+
+    def test_new_model_blocks_animation_of_older_model(self):
+        from studio.animations import request_animation
+        item = self.ready_humanoid()
+        self.item()
+        with self.assertRaises(ValidationError):
+            request_animation(item.pk, self.student, ['walk'])
+        item.refresh_from_db(); self.assertEqual(item.status, 'ready')
+
+    def test_rejected_animation_keeps_original_downloadable_and_allows_retry(self):
+        from studio.animations import request_animation
+        item = self.ready_humanoid()
+        request_animation(item.pk, self.student, ['walk'])
+        review_request(item.pk, self.teacher, 'reject', 'Попробуй ожидание')
+        self.client.force_login(self.student)
+        response = self.client.get(reverse('file', args=[item.pk, 'fbx']))
+        self.assertEqual(response.status_code, 200); response.close()
+        request_animation(item.pk, self.student, ['idle'])
+        item.refresh_from_db(); self.assertEqual(item.animation_actions, ['idle'])
+
+    @override_settings(MESHY_API_KEY='test-secret')
+    def test_rig_and_animation_api_contract_and_nonhumanoid_rejection(self):
+        from studio.animations import request_animation
+        item = self.ready_humanoid('live')
+        request_animation(item.pk, self.student, ['walk', 'run']); item.refresh_from_db()
+        api = Meshy(); api.session = Mock()
+        api.session.post.return_value.status_code = 200
+        api.session.post.return_value.json.return_value = {'result': 'new-task-123'}
+        self.assertEqual(api.submit(item), 'new-task-123')
+        args, kw = api.session.post.call_args
+        self.assertEqual(args[0], 'https://api.meshy.ai/openapi/v1/rigging')
+        self.assertEqual(kw['json'], {'input_task_id': item.model_task_id, 'height_meters': 1.7})
+        item.generation_stage, item.rig_task_id = 'animation', 'rig-123'
+        api.submit(item)
+        self.assertEqual(api.session.post.call_args.args[0], 'https://api.meshy.ai/openapi/v1/animations')
+        self.assertEqual(api.session.post.call_args.kwargs['json'], {'rig_task_id': 'rig-123', 'action_ids': [566, 530]})
+        self.assertFalse(api.session.post.call_args.kwargs['allow_redirects'])
+        for kind in ('animal', 'object'):
+            item.model_kind = kind
+            with self.assertRaises(ProviderError): api.submit(item)
+        self.assertEqual(api.session.post.call_count, 2)
+
+    def test_live_animation_full_chain_archives_fbx_preserves_model_and_reuses_rig(self):
+        import zipfile
+        from studio.animations import request_animation
+        from studio.provider import demo_fbx
+        from studio.services import monthly_usage
+        item = self.ready_humanoid('live')
+        original_fbx, original_id = item.model_fbx.name, item.model_task_id
+        request_animation(item.pk, self.student, ['walk', 'idle'])
+        self.approve(item)
+        def download(target, field, url, filename):
+            content = demo_glb() if filename.endswith('.glb') else demo_fbx()
+            getattr(target, field).save(filename, ContentFile(content), save=True)
+        with patch('studio.tasks.Meshy') as api, patch('studio.animations.download_to_field', side_effect=download):
+            api.return_value.submit.side_effect = ['rig-live-123', 'animation-live-123', 'animation-second-123']
+            self.animation_tick(item)
+            self.assertEqual(item.rig_task_id, 'rig-live-123')
+            api.return_value.poll.return_value = {'status': 'SUCCEEDED', 'consumed_credits': 5,
+                'result': {'rigged_character_fbx_url': 'https://assets.meshy.ai/rig.fbx'}}
+            self.animation_tick(item)
+            self.assertEqual((item.status, item.generation_stage), ('approved', 'animation'))
+            self.assertEqual(item.rig_credits, 5)
+            self.assertTrue(item.rigged_fbx)
+            self.animation_tick(item)
+            api.return_value.poll.return_value = {'status': 'SUCCEEDED', 'consumed_credits': 9,
+                'result': {'animation_fbx_url': 'https://assets.meshy.ai/motion.fbx',
+                           'animation_glb_url': 'https://assets.meshy.ai/motion.glb'}}
+            self.animation_tick(item)
+            self.assertEqual(item.status, 'ready')
+            self.assertEqual(api.return_value.submit.call_count, 2)
+            self.assertEqual(item.model_fbx.name, original_fbx)
+            self.assertEqual(item.model_task_id, original_id)
+            self.assertEqual(item.consumed_credits, 20)
+            asset = item.animations.get(ready=True)
+            self.assertEqual(asset.consumed_credits, 9)
+            with asset.unity_package.open('rb') as stream, zipfile.ZipFile(stream) as archive:
+                self.assertIn('animation.fbx', archive.namelist())
+                self.assertIn('Humanoid', archive.read('UNITY-ANIMATION.txt').decode())
+                self.assertEqual(archive.read('original-model.zip'), b'original-model-package')
+            self.assertEqual(monthly_usage(timezone.localdate().replace(day=1)), 1)
+            request_animation(item.pk, self.student, ['run']); item.refresh_from_db()
+            self.assertEqual(item.generation_stage, 'animation')
+            self.approve(item); self.animation_tick(item)
+            self.assertEqual(api.return_value.submit.call_count, 3)
+            self.assertEqual(item.animations.filter(ready=True).count(), 1)
+            self.assertNotEqual(item.animation_job_id, asset.pk)
+            self.client.force_login(self.student)
+            response = self.client.get(reverse('animation_file', args=[asset.pk, 'fbx']))
+            self.assertEqual(response.status_code, 200); response.close()
+
+    def test_animation_timeout_never_resubmits_and_reconciles_rig(self):
+        from studio.animations import request_animation
+        item = self.ready_humanoid('live')
+        request_animation(item.pk, self.student, ['walk']); self.approve(item)
+        with patch('studio.tasks.Meshy') as api:
+            api.return_value.submit.side_effect = SubmissionUncertain('Timeout')
+            self.animation_tick(item); self.animation_tick(item)
+            api.return_value.submit.assert_called_once()
+            self.assertEqual(item.status, 'uncertain')
+        self.client.force_login(self.teacher)
+        with patch('studio.provider.Meshy.poll', return_value={'status': 'IN_PROGRESS'}):
+            self.client.post(reverse('reconcile', args=[item.pk]), {'confirmed': 'on', 'task_id': 'recovered-rig-123'})
+        item.refresh_from_db()
+        self.assertEqual((item.status, item.rig_task_id), ('running', 'recovered-rig-123'))
+
+    def test_missing_animation_fbx_keeps_slot_and_retries_only_get(self):
+        from studio.animations import request_animation
+        item = self.ready_humanoid('live')
+        request_animation(item.pk, self.student, ['walk'])
+        Request.objects.filter(pk=item.pk).update(generation_stage='animation', status='running',
+            rig_task_id='rig-ok', provider_task_id='motion-existing')
+        with patch('studio.tasks.Meshy') as api:
+            api.return_value.poll.return_value = {'status': 'SUCCEEDED', 'result': {}}
+            self.animation_tick(item); self.animation_tick(item)
+            api.return_value.submit.assert_not_called()
+            self.assertEqual(api.return_value.poll.call_count, 2)
+        self.assertEqual(item.status, 'saving')
+        self.assertFalse(item.animations.filter(ready=True).exists())
+
+    def test_animation_files_are_private_even_while_new_animation_is_pending(self):
+        from studio.models import AnimationAsset
+        from studio.animations import request_animation
+        item = self.ready_humanoid()
+        asset = AnimationAsset.objects.create(request=item, names='Walking', mode='live', ready=True)
+        asset.fbx.save('motion.fbx', ContentFile(b'FBX'), save=True)
+        request_animation(item.pk, self.student, ['run'])
+        self.client.force_login(self.other)
+        self.assertEqual(self.client.get(reverse('animation_file', args=[asset.pk, 'fbx'])).status_code, 404)
+        self.client.force_login(self.teacher)
+        response = self.client.get(reverse('animation_file', args=[asset.pk, 'fbx']))
+        self.assertEqual(response.status_code, 200); response.close()
+        self.client.force_login(self.student)
+        self.assertContains(self.client.get(reverse('detail', args=[item.pk])), 'FBX с анимацией')
+        asset.ready = False; asset.save()
+        self.assertEqual(self.client.get(reverse('animation_file', args=[asset.pk, 'fbx'])).status_code, 404)
+
+    def test_animation_and_model_share_capacity_and_fifo(self):
+        from studio.animations import request_animation
+        from studio.tasks import claim
+        item = self.ready_humanoid()
+        earlier = self.approve(self.item(self.other))
+        request_animation(item.pk, self.student, ['walk']); self.approve(item)
+        self.assertIsNone(claim(item.pk))
+        self.assertIsNotNone(claim(earlier.pk))
+        Policy.objects.filter(pk=1).update(max_parallel=1)
+        self.assertIsNone(claim(item.pk))
+        Request.objects.filter(pk=earlier.pk).update(status='ready', lease_until=None)
+        self.assertIsNotNone(claim(item.pk))
+
+    def test_demo_animation_has_real_transform_clips_and_releases_student(self):
+        import json, struct
+        from studio.animations import request_animation
+        item = self.ready_humanoid()
+        request_animation(item.pk, self.student, ['walk', 'run']); self.approve(item)
+        self.animation_tick(item); self.animation_tick(item, finish=True)
+        self.assertEqual((item.status, item.generation_stage), ('approved', 'animation'))
+        self.animation_tick(item); self.animation_tick(item, finish=True)
+        self.assertEqual(item.status, 'ready')
+        asset = item.animations.get(ready=True)
+        with asset.glb.open('rb') as source:
+            data = source.read()
+        meta_size = struct.unpack_from('<I', data, 12)[0]
+        doc = json.loads(data[20:20+meta_size])
+        self.assertEqual([clip['name'] for clip in doc['animations']], ['walking_2', 'run_fast_3'])
+        with asset.fbx.open('rb') as source:
+            self.assertIn(b'AnimationCurve:', source.read())
+        form = self.make_form(); self.assertTrue(form.is_valid())
+        self.assertEqual(create_request(self.student, form).status, 'pending')

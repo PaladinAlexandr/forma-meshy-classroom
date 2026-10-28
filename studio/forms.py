@@ -14,7 +14,7 @@ class RequestForm(forms.ModelForm):
 
     class Meta:
         model = Request
-        fields = ['title', 'source', 'image', 'text_prompt', 'preset', 'note']
+        fields = ['model_kind', 'title', 'source', 'image', 'text_prompt', 'preset', 'note']
         widgets = {'note': forms.Textarea(attrs={'rows': 3, 'placeholder': 'Что ты хочешь создать? Это сообщение прочитает преподаватель.'}),
                    'title': forms.TextInput(attrs={'placeholder': 'Например, мой космический робот', 'maxlength': 100}),
                    'text_prompt': forms.Textarea(attrs={'rows': 5, 'maxlength': 800, 'placeholder': 'Например: маленький добрый робот с круглой головой, синим корпусом и большими колёсами. Один предмет целиком на простом фоне.'})}
@@ -22,8 +22,12 @@ class RequestForm(forms.ModelForm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.fields['preset'].queryset = Preset.objects.filter(active=True)
+        self.fields['model_kind'].required = False
         self.fields['note'].required = False
         self.fields['image'].widget.attrs['accept'] = 'image/jpeg,image/png,image/webp'
+
+    def clean_model_kind(self):
+        return self.cleaned_data.get('model_kind') or 'object'
 
     def clean_source(self):
         return self.cleaned_data.get('source') or 'photo'

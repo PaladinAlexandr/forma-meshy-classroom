@@ -41,6 +41,8 @@ def review_request(item_id, reviewer, decision, note=''):
     if decision == 'reject' and not note.strip():
         raise ValidationError('Укажите причину возврата.')
     if decision == 'approve':
+        if item.is_animation and item.model_kind != 'humanoid':
+            raise ValidationError('Анимация доступна только для гуманоидов.')
         if Request.objects.filter(student=item.student, status__in=UNFINISHED_STATUSES).exclude(pk=item.pk).exists():
             raise ValidationError('У ученика уже есть незавершённый проект. Сначала завершите предыдущий.')
         month = timezone.localdate().replace(day=1)

@@ -30,6 +30,8 @@ class Meshy:
     def submit(self, item):
         if not settings.MESHY_API_KEY:
             raise ProviderError('На сервере не задан MESHY_API_KEY. Сообщите администратору.')
+        if item.is_animation:
+            return self.submit_animation(item)
         url = self.task_url(item)
         if item.generation_stage == 'image':
             payload = {'ai_model': item.image_model, 'prompt': item.text_prompt,
@@ -41,6 +43,23 @@ class Meshy:
                        'should_texture': True, 'texture_prompt': item.prompt_snapshot,
                        'moderation': True, 'enable_pbr': True, 'texture_resolution': '2k',
                        'target_formats': ['glb', 'fbx']}
+        return self.post_task(url, payload)
+
+    def submit_animation(self, item):
+        from .animations import ACTIONS
+        if item.model_kind != 'humanoid':
+            raise ProviderError('Автоматическая анимация доступна только для гуманоидов.')
+        if item.generation_stage == 'rig':
+            if not item.model_task_id:
+                raise ProviderError('Нет ID исходной модели Meshy.')
+            payload = {'input_task_id': item.model_task_id, 'height_meters': 1.7}
+        else:
+            if not item.rig_task_id or not item.animation_actions or any(key not in ACTIONS for key in item.animation_actions):
+                raise ProviderError('Нет скелета или выбранных движений.')
+            payload = {'rig_task_id': item.rig_task_id, 'action_ids': [ACTIONS[key]['id'] for key in item.animation_actions]}
+        return self.post_task(self.task_url(item), payload)
+
+    def post_task(self, url, payload):
         try:
             response = self.session.post(url, json=payload, timeout=(10, 90), allow_redirects=False)
         except requests.RequestException as exc:
@@ -63,7 +82,8 @@ class Meshy:
             raise SubmissionUncertain('Meshy принял запрос, но ID задачи не удалось прочитать.') from exc
 
     def task_url(self, item):
-        return 'https://api.meshy.ai/openapi/v1/text-to-image' if item.generation_stage == 'image' else self.url
+        endpoints = {'image': 'text-to-image', 'model': 'image-to-3d', 'rig': 'rigging', 'animation': 'animations'}
+        return 'https://api.meshy.ai/openapi/v1/' + endpoints[item.generation_stage]
 
     def poll(self, item):
         try:

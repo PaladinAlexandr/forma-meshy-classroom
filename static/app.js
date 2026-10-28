@@ -1,5 +1,22 @@
 (() => {
   'use strict';
+  document.querySelectorAll('[data-animation-viewer]').forEach(select => {
+    const viewer = document.getElementById(select.dataset.animationViewer);
+    if (!viewer) return;
+    const populate = () => {
+      select.replaceChildren();
+      (viewer.availableAnimations || []).forEach(name => {
+        const option = document.createElement('option');
+        option.value = name;
+        option.textContent = ({Idle_3: 'Ожидание', walking_2: 'Ходьба', run_fast_3: 'Бег'})[name] || name;
+        select.append(option);
+      });
+      select.disabled = !select.options.length;
+    };
+    viewer.addEventListener('load', populate);
+    if (viewer.loaded) populate();
+    select.addEventListener('change', () => { viewer.animationName = select.value; viewer.play(); });
+  });
   document.querySelector('[data-refresh]')?.addEventListener('click', () => location.reload());
   let changedForm = false;
   document.querySelectorAll('form').forEach(form => {
