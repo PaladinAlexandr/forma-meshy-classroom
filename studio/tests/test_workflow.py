@@ -709,7 +709,7 @@ class WorkflowTests(TestCase):
         review_request(item.pk, self.teacher, 'reject', 'Попробуй ожидание')
         self.client.force_login(self.student)
         response = self.client.get(reverse('file', args=[item.pk, 'fbx']))
-        self.assertEqual(response.status_code, 200); response.close()
+        self.assertEqual(response.status_code, 200); self.assertTrue(b''.join(response.streaming_content))
         request_animation(item.pk, self.student, ['idle'])
         item.refresh_from_db(); self.assertEqual(item.animation_actions, ['idle'])
 
@@ -782,7 +782,7 @@ class WorkflowTests(TestCase):
             self.assertNotEqual(item.animation_job_id, asset.pk)
             self.client.force_login(self.student)
             response = self.client.get(reverse('animation_file', args=[asset.pk, 'fbx']))
-            self.assertEqual(response.status_code, 200); response.close()
+            self.assertEqual(response.status_code, 200); self.assertTrue(b''.join(response.streaming_content))
 
     def test_animation_timeout_never_resubmits_and_reconciles_rig(self):
         from studio.animations import request_animation
@@ -824,7 +824,7 @@ class WorkflowTests(TestCase):
         self.assertEqual(self.client.get(reverse('animation_file', args=[asset.pk, 'fbx'])).status_code, 404)
         self.client.force_login(self.teacher)
         response = self.client.get(reverse('animation_file', args=[asset.pk, 'fbx']))
-        self.assertEqual(response.status_code, 200); response.close()
+        self.assertEqual(response.status_code, 200); self.assertTrue(b''.join(response.streaming_content))
         self.client.force_login(self.student)
         self.assertContains(self.client.get(reverse('detail', args=[item.pk])), 'FBX с анимацией')
         asset.ready = False; asset.save()
