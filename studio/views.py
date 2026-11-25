@@ -15,8 +15,8 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_POST
-from .access import is_teacher, visible_requests
-from .forms import RequestForm, ReviewForm, StudentForm, PolicyForm
+from .access import is_teacher, visible_requests, student_accounts
+from .forms import RequestForm, ReviewForm, StudentForm, StudentEditForm, PolicyForm
 from .models import Event, Policy, Preset, Request, UNFINISHED_STATUSES
 from .services import create_request, review_request, choose_generated_image, monthly_usage
 
@@ -62,6 +62,8 @@ def demo_login(request, role):
 def dashboard(request):
     base = visible_requests(request.user)
     status = request.GET.get('status', '')
+    if status == 'trash' and is_teacher(request.user):
+        base = visible_requests(request.user, include_deleted=True).filter(deleted_at__isnull=False)
     query = request.GET.get('q', '').strip()[:100]
     qs = base
     if status == 'active':
@@ -103,12 +105,13 @@ def new_request(request):
 
 @login_required
 def detail(request, pk):
-    item = get_object_or_404(visible_requests(request.user), pk=pk)
+    item = get_object_or_404(visible_requests(request.user, include_deleted=True), pk=pk)
     from .animations import AnimationForm
     can_animate = (item.model_kind == 'humanoid' and item.model_fbx and
-        (item.status == 'ready' or (item.is_animation and item.status in ('rejected', 'failed'))))
+        (item.status == 'ready' or (item.is_animation and item.status in ('rejected', 'failed', 'canceled'))))
     return render(request, 'detail.html', {'item': item, 'events': item.events.select_related('actor'),
         'animation_form': AnimationForm(), 'can_animate': can_animate,
+        'can_close': item.status in UNFINISHED_STATUSES,
         'animation_assets': item.animations.filter(ready=True),
         'review_form': ReviewForm(), 'can_review': is_teacher(request.user) and item.status == 'pending'})
 
@@ -135,7 +138,7 @@ def animate(request, pk):
 @login_required
 def animation_file(request, pk, kind):
     from .models import AnimationAsset
-    asset = get_object_or_404(AnimationAsset, pk=pk, ready=True, request__in=visible_requests(request.user))
+    asset = get_object_or_404(AnimationAsset, pk=pk, ready=True, request__in=visible_requests(request.user, include_deleted=True))
     fields = {'fbx': ('fbx', 'application/octet-stream', 'fbx'),
               'glb': ('glb', 'model/gltf-binary', 'glb'),
               'unity': ('unity_package', 'application/zip', 'zip')}
@@ -185,11 +188,12 @@ def choose_image(request, pk):
 
 @login_required
 def private_file(request, pk, kind):
-    item = get_object_or_404(visible_requests(request.user), pk=pk)
+    item = get_object_or_404(visible_requests(request.user, include_deleted=True), pk=pk)
     fields = {'image': ('image', 'image/jpeg'), 'glb': ('model_glb', 'model/gltf-binary'),
               'fbx': ('model_fbx', 'application/octet-stream'),
               'unity': ('unity_package', 'application/zip')}
-    if kind not in fields or (kind != 'image' and item.status != 'ready' and not item.is_animation):
+    partial_model = item.status == 'failed' and item.model_fbx and item.model_glb
+    if kind not in fields or (kind != 'image' and item.status != 'ready' and not item.is_animation and not partial_model):
         raise Http404
     field, mime = fields[kind]
     value = getattr(item, field)
@@ -226,10 +230,92 @@ def students(request):
             return redirect('students')
         except IntegrityError:
             form.add_error('username', 'Этот логин уже занят.')
-    people = get_user_model().objects.filter(is_staff=False, is_superuser=False).exclude(
-        groups__permissions__codename='moderate_request').exclude(user_permissions__codename='moderate_request').distinct()
+    people = student_accounts()
     people = people.annotate(request_count=Count('model_requests')).order_by('first_name', 'username')
     return render(request, 'students.html', {'form': form, 'students': people})
+
+
+@teacher_required
+def student_edit(request, pk):
+    from .management_services import edit_student
+    student = get_object_or_404(student_accounts(), pk=pk)
+    form = StudentEditForm(request.POST or None, student=student, initial={
+        'username': student.username, 'first_name': student.first_name, 'is_active': student.is_active})
+    if request.method == 'POST' and form.is_valid():
+        try:
+            edit_student(pk, request.user, form)
+            messages.success(request, 'Данные ученика сохранены.')
+            return redirect('students')
+        except (ValidationError, IntegrityError):
+            form.add_error(None, 'Не удалось сохранить ученика: логин занят или аккаунт уже изменён.')
+    return render(request, 'student_edit.html', {'form': form, 'student': student})
+
+
+@teacher_required
+def student_delete(request, pk):
+    from .management_services import delete_student
+    student = get_object_or_404(student_accounts(), pk=pk)
+    if request.method == 'POST' and request.POST.get('confirmed') == 'on':
+        try:
+            delete_student(pk, request.user)
+            messages.success(request, 'Ученик удалён из списка, вход закрыт. История заявок сохранена.')
+            return redirect('students')
+        except ValidationError as exc:
+            messages.error(request, ' '.join(exc.messages))
+    return render(request, 'student_delete.html', {'student': student})
+
+
+@teacher_required
+def request_manage(request, pk, operation):
+    from .management_services import close_request
+    item = get_object_or_404(visible_requests(request.user, include_deleted=True), pk=pk)
+    if request.method == 'POST' and request.POST.get('confirmed') == 'on':
+        close_request(pk, request.user, hide=operation == 'delete')
+        messages.success(request, 'Заявка перемещена в корзину.' if operation == 'delete' else 'Завершение обработки запрошено.')
+        return redirect('dashboard' if operation == 'delete' else 'detail', **({} if operation == 'delete' else {'pk': pk}))
+    return render(request, 'request_manage.html', {'item': item, 'operation': operation,
+        'provider_active': item.status in ('running', 'submitting', 'uncertain')})
+
+
+@teacher_required
+@require_POST
+def request_restore(request, pk):
+    from .management_services import restore_request
+    get_object_or_404(Request, pk=pk)
+    restore_request(pk, request.user)
+    messages.success(request, 'Заявка восстановлена. Генерация повторно не отправляется.')
+    return redirect('detail', pk=pk)
+
+
+@teacher_required
+def recover_tasks(request, pk):
+    from datetime import datetime, timezone as datetime_timezone
+    from .provider import Meshy, ProviderError
+    item = get_object_or_404(Request, pk=pk, status='uncertain')
+    tasks = []
+    try:
+        page = max(1, min(10000, int(request.GET.get('page', '1'))))
+    except ValueError:
+        page = 1
+    has_next = False
+    try:
+        records = Meshy().list_tasks(item, page=page) if item.provider_mode == 'live' else []
+        has_next = len(records) == 50
+        for row in records:
+            identifier = row['id']
+            used = Request.objects.exclude(pk=pk).filter(Q(provider_task_id=identifier) | Q(model_task_id=identifier)
+                | Q(image_task_id=identifier) | Q(rig_task_id=identifier)).exists()
+            if used:
+                continue
+            try:
+                created = datetime.fromtimestamp(float(row.get('created_at', 0)) / 1000, datetime_timezone.utc)
+            except (TypeError, ValueError, OverflowError, OSError):
+                created = None
+            tasks.append({'id': identifier, 'created': created, 'status': row.get('status', '')})
+    except ProviderError as exc:
+        messages.error(request, str(exc))
+    return render(request, 'recover_tasks.html', {'item': item, 'tasks': tasks,
+        'previous_page': page - 1 if page > 1 else None, 'next_page': page + 1 if has_next else None})
 
 
 @teacher_required
@@ -255,13 +341,12 @@ def center_settings(request):
 @require_POST
 def reconcile(request, pk):
     """Manual recovery without a second paid POST, after checking provider history."""
-    import re
-    from .provider import Meshy, ProviderError
+    from .provider import Meshy, ProviderError, task_id as valid_task_id
     task_id = request.POST.get('task_id', '').strip()
     if request.POST.get('confirmed') != 'on':
         messages.error(request, 'Подтвердите, что сверили задачу с аккаунтом Meshy.')
         return redirect('detail', pk=pk)
-    if task_id and not re.fullmatch(r'[A-Za-z0-9-]{10,100}', task_id):
+    if task_id and not valid_task_id(task_id):
         messages.error(request, 'Некорректный ID задачи Meshy.')
         return redirect('detail', pk=pk)
     item = get_object_or_404(Request, pk=pk)
@@ -281,6 +366,9 @@ def reconcile(request, pk):
             item = Request.objects.select_for_update().get(pk=pk)
             if item.status != 'uncertain':
                 raise ValidationError('Состояние заявки уже изменилось.')
+            if task_id and Request.objects.exclude(pk=pk).filter(Q(provider_task_id=task_id) | Q(model_task_id=task_id)
+                    | Q(image_task_id=task_id) | Q(rig_task_id=task_id)).exists():
+                raise ValidationError('Эта задача уже привязана к другому проекту.')
             item.provider_task_id = task_id or None
             if task_id and item.generation_stage == 'image':
                 item.image_task_id = task_id

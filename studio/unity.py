@@ -12,7 +12,7 @@ import zipfile
 import requests
 from django.core.files import File
 from PIL import Image, ImageOps
-from .provider import ProviderError, safe_asset_url
+from .provider import ProviderError, PermanentProviderError, safe_asset_url
 
 UNITY_GUIDE = '''FORMA · Модель для Unity 6 / Universal Render Pipeline
 
@@ -58,13 +58,13 @@ def texture_bytes(url):
             for part in response.iter_content(128 * 1024):
                 out.write(part)
                 if out.tell() > 32 * 1024 * 1024:
-                    raise ProviderError('Текстура превышает лимит 32 МБ.')
+                    raise PermanentProviderError('Текстура превышает лимит 32 МБ.')
             out.seek(0)
             with warnings.catch_warnings():
                 warnings.simplefilter('error', Image.DecompressionBombWarning)
                 image = Image.open(out)
                 if image.width * image.height > 20_000_000:
-                    raise ProviderError('Текстура превышает лимит 20 мегапикселей.')
+                    raise PermanentProviderError('Текстура превышает лимит 20 мегапикселей.')
                 image.load()
                 return image.convert('RGBA')
     except (requests.RequestException, OSError, ValueError, Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
@@ -112,4 +112,5 @@ def build_unity_package(item, texture_sets, demo=False):
             archive.writestr(f'{root}/IMPORT_IN_UNITY.txt', UNITY_GUIDE.encode('utf-8'))
             archive.writestr(f'{root}/model_materials.json', json.dumps(manifest, indent=2, ensure_ascii=False).encode('utf-8'))
         tmp.seek(0)
-        item.unity_package.save('unity-fbx-textures.zip', File(tmp), save=True)
+        item.unity_package.save('unity-fbx-textures.zip', File(tmp), save=False)
+        item.save(update_fields=['unity_package'])

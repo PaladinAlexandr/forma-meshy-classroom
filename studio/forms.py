@@ -84,9 +84,13 @@ class StudentForm(forms.Form):
     first_name = forms.CharField(label='Имя или псевдоним', max_length=40)
     password = forms.CharField(label='Начальный пароль', widget=forms.PasswordInput, min_length=8, max_length=128)
 
+    def __init__(self, *args, student=None, **kwargs):
+        self.student = student
+        super().__init__(*args, **kwargs)
+
     def clean_username(self):
         name = self.cleaned_data['username'].lower()
-        if get_user_model().objects.filter(username__iexact=name).exists():
+        if get_user_model().objects.filter(username__iexact=name).exclude(pk=self.student.pk if self.student else None).exists():
             raise forms.ValidationError('Этот логин уже занят.')
         return name
 
@@ -99,6 +103,12 @@ class StudentForm(forms.Form):
             except forms.ValidationError as e:
                 self.add_error('password', e)
         return data
+
+
+class StudentEditForm(StudentForm):
+    password = forms.CharField(label='Новый пароль', required=False, widget=forms.PasswordInput,
+        min_length=8, max_length=128, help_text='Оставьте пустым, чтобы сохранить текущий пароль.')
+    is_active = forms.BooleanField(label='Разрешить вход', required=False, initial=True)
 
 
 class PolicyForm(forms.ModelForm):

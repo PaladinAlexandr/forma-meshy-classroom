@@ -1,0 +1,5 @@
+{% extends 'base.html' %}{% block title %}Редактировать ученика{% endblock %}{% block crumb %}Ученики{% endblock %}{% block content %}
+<a class="back" href="{% url 'students' %}">← К ученикам</a><div class="page-title"><h1>Аккаунт ученика</h1><p>{{ student.first_name|default:student.username }}</p></div>
+<section class="panel management-form"><form method="post" class="stack">{% csrf_token %}{{ form.non_field_errors }}
+{% for field in form %}<div class="field"><label for="{{ field.id_for_label }}">{{ field.label }}</label>{{ field }}{{ field.errors }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}</div>{% endfor %}
+<button class="btn primary">Сохранить изменения</button></form></section>{% endblock %}

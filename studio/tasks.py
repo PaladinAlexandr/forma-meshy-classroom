@@ -11,7 +11,7 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 from .models import Request, Event, Policy
-from .provider import Meshy, ProviderError, SubmissionUncertain, archive_result, archive_image, demo_image, demo_glb, demo_fbx
+from .provider import Meshy, ProviderError, PermanentProviderError, SubmissionUncertain, safe_message, archive_result, archive_image, demo_image, demo_glb, demo_fbx
 
 LEASE = timedelta(minutes=12)  # longer than the Celery hard limit
 
@@ -20,8 +20,38 @@ def event(item, text):
     Event.objects.create(request=item, text=text)
 
 
+WORKER_FIELDS = ['status', 'progress', 'provider_task_id', 'provider_mode', 'provider_model',
+    'image_task_id', 'model_task_id', 'rig_task_id', 'image_model', 'image_credits', 'rig_credits',
+    'generation_stage', 'submitted_at', 'finished_at', 'next_poll_at', 'lease_until', 'poll_failures',
+    'error', 'model_glb', 'model_fbx', 'image', 'unity_package', 'rigged_fbx', 'consumed_credits', 'preview', 'updated_at']
+
+
+def save_worker(item):
+    # Worker snapshots must never undo a teacher's deletion/cancellation.
+    with transaction.atomic():
+        current = Request.objects.select_for_update().get(pk=item.pk)
+        if current.status == 'canceled' or (current.cancel_requested and item.status in ('ready', 'image_ready', 'approved', 'failed')):
+            item.status = 'canceled'
+            item.finished_at, item.next_poll_at = timezone.now(), None
+            item.error = 'Заявка закрыта преподавателем.'
+        item.save(update_fields=WORKER_FIELDS)
+
+
+def cancellation_requested(item):
+    return Request.objects.filter(pk=item.pk, cancel_requested=True).exists()
+
+
+def finish_canceled(item):
+    item.status, item.finished_at, item.next_poll_at = 'canceled', timezone.now(), None
+    item.error = 'Заявка закрыта преподавателем. Генерация в Meshy завершена.'
+    event(item, item.error)
+
+
 def sweep():
     now = timezone.now()
+    Request.objects.filter(status='saving', cancel_requested=True).filter(
+        Q(lease_until__isnull=True) | Q(lease_until__lt=now)).update(
+            status='canceled', finished_at=now, lease_until=None, next_poll_at=None)
     # Crash after POST may have created a paid provider task. Never resubmit.
     for pk in Request.objects.filter(status='submitting', lease_until__lt=now).values_list('pk', flat=True):
         if Request.objects.filter(pk=pk, status='submitting', lease_until__lt=now).update(
@@ -84,13 +114,14 @@ def process(pk):
             except SubmissionUncertain as exc:
                 item.status, item.error = 'uncertain', str(exc)
                 item.lease_until = None
-                item.save()
+                save_worker(item)
                 event(item, 'Отправка требует проверки преподавателя. Повторная отправка заблокирована.')
                 return
             except ProviderError as exc:
                 item.status, item.error = 'failed', str(exc)
+                item.finished_at = timezone.now()
                 item.lease_until = None
-                item.save()
+                save_worker(item)
                 event(item, item.error)
                 return
             item.provider_task_id, item.status, item.progress = task_id, 'running', 5
@@ -101,10 +132,11 @@ def process(pk):
             elif item.generation_stage == 'model':
                 item.model_task_id = task_id
             item.error = ''
+            save_worker(item)
             event(item, 'Заявка принята Meshy. Началась генерация.' if item.provider_mode == 'live' else 'Началась демонстрационная генерация. Кредиты Meshy не используются.')
             item.next_poll_at = timezone.now() + timedelta(seconds=10)
             item.lease_until = None
-            item.save()
+            save_worker(item)
             return
 
         if item.provider_mode == 'demo':
@@ -112,6 +144,8 @@ def process(pk):
             if age < 30:
                 item.progress = min(95, max(10, int(age * 3)))
                 item.next_poll_at = timezone.now() + timedelta(seconds=5)
+            elif cancellation_requested(item):
+                finish_canceled(item)
             elif item.is_animation:
                 from .demo_animation import finish_demo_animation
                 finish_demo_animation(item)
@@ -133,7 +167,9 @@ def process(pk):
             if result['status'] == 'SUCCEEDED':
                 item.status = 'saving'
                 item.save(update_fields=['status', 'updated_at'])
-                if item.generation_stage == 'rig':
+                if cancellation_requested(item):
+                    finish_canceled(item)
+                elif item.generation_stage == 'rig':
                     from .animations import finish_rig
                     finish_rig(item, result)
                 elif item.generation_stage == 'animation':
@@ -147,16 +183,26 @@ def process(pk):
                     finish(item, result.get('consumed_credits'))
             elif result['status'] in ('FAILED', 'CANCELED'):
                 item.status = 'failed'
+                detail = result.get('task_error') or {}
+                detail = safe_message(detail.get('message', detail.get('error_code', '')) if isinstance(detail, dict) else detail)
                 item.error = ('Meshy не смог подготовить скелет или анимацию. Для риггинга нужен текстурированный гуманоид с чёткими руками и ногами в T/A-позе.' if item.is_animation else 'Meshy не смог выполнить генерацию. Преподаватель поможет подготовить новую заявку.')
+                if detail:
+                    item.error += ' Meshy: ' + detail
                 item.finished_at = timezone.now()
                 event(item, item.error)
             else:
                 item.progress = max(item.progress, min(99, int(result.get('progress', 0))))
                 item.next_poll_at = timezone.now() + timedelta(seconds=15)
             item.poll_failures = 0
-            item.error = '' if item.status != 'failed' else item.error
+            item.error = '' if item.status not in ('failed', 'canceled') else item.error
         item.lease_until = None
-        item.save()
+        save_worker(item)
+    except PermanentProviderError as exc:
+        item.refresh_from_db()
+        item.status, item.error = 'failed', str(exc)[:1000]
+        item.finished_at, item.next_poll_at, item.lease_until = timezone.now(), None, None
+        save_worker(item)
+        event(item, item.error)
     except Exception as exc:
         # Do not downgrade/overwrite a committed task ID after a partial failure.
         item.refresh_from_db()
@@ -167,8 +213,11 @@ def process(pk):
             item.poll_failures += 1
             item.error = str(exc)[:500] if isinstance(exc, ProviderError) else 'Временная ошибка обработки. Автоматически повторим проверку.'
             item.next_poll_at = timezone.now() + timedelta(seconds=min(900, 15 * 2 ** min(item.poll_failures, 6)))
+            if item.status == 'saving' and item.poll_failures >= 8:
+                item.status, item.finished_at, item.next_poll_at = 'failed', timezone.now(), None
+                item.error = 'Не удалось сохранить готовый результат после 8 проверок. Заявка завершена; можно создать новую. ' + item.error
         item.lease_until = None
-        item.save()
+        save_worker(item)
 
 
 def finish(item, credits):

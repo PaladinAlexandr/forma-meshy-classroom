@@ -521,6 +521,7 @@ class WorkflowTests(TestCase):
             self.assertEqual(call.kwargs['json']['ai_model'], 'nano-banana')
             self.assertNotIn('image_url', call.kwargs['json'])
             item.provider_task_id = 'image-task-001'
+            factory.return_value.get.return_value.status_code = 200
             factory.return_value.get.return_value.json.return_value = {'status': 'IN_PROGRESS'}
             Meshy().poll(item)
             self.assertTrue(factory.return_value.get.call_args.args[0].endswith('/text-to-image/image-task-001'))
@@ -862,3 +863,267 @@ class WorkflowTests(TestCase):
             self.assertIn(b'AnimationCurve:', source.read())
         form = self.make_form(); self.assertTrue(form.is_valid())
         self.assertEqual(create_request(self.student, form).status, 'pending')
+
+    @override_settings(MESHY_API_KEY='test-secret')
+    def test_all_creation_endpoints_accept_http_202(self):
+        item = self.ready_humanoid('live')
+        item.animation_actions, item.rig_task_id = ['walk'], 'rig-task'
+        item.image_model, item.provider_model = 'nano-banana', 'meshy-7.1'
+        api = Meshy(); api.session = Mock()
+        api.session.post.return_value.status_code = 202
+        api.session.post.return_value.json.return_value = {'result': 'accepted-task-id'}
+        for stage in ('image', 'model', 'rig', 'animation'):
+            item.generation_stage = stage
+            self.assertEqual(api.submit(item), 'accepted-task-id')
+        self.assertEqual(api.session.post.call_count, 4)
+
+    @override_settings(MESHY_API_KEY='test-secret')
+    def test_rig_http_202_task_id_is_saved_without_manual_reconciliation(self):
+        from studio.animations import request_animation
+        item = self.ready_humanoid('live')
+        request_animation(item.pk, self.student, ['walk']); self.approve(item)
+        session = Mock(); session.headers = {}; session.post.return_value.status_code = 202
+        session.post.return_value.json.return_value = {'result': 'accepted-rig-task'}
+        with patch('studio.provider.requests.Session', return_value=session):
+            self.animation_tick(item)
+        self.assertEqual((item.status, item.provider_task_id, item.rig_task_id), ('running', 'accepted-rig-task', 'accepted-rig-task'))
+        session.post.assert_called_once()
+
+    @override_settings(MESHY_API_KEY='test-secret')
+    def test_definitive_413_is_failure_and_secret_is_redacted(self):
+        from studio.provider import PermanentProviderError
+        item = self.ready_humanoid('live'); item.generation_stage = 'rig'
+        api = Meshy(); api.session = Mock(); api.session.post.return_value.status_code = 413
+        api.session.post.return_value.json.return_value = {'message': 'Too large test-secret https://assets.meshy.ai/?signed=private'}
+        with self.assertRaises(PermanentProviderError) as caught:
+            api.submit(item)
+        self.assertIn('413', str(caught.exception))
+        self.assertNotIn('test-secret', str(caught.exception))
+        self.assertNotIn('signed=private', str(caught.exception))
+
+    def test_oversized_provider_asset_stops_before_stream_or_storage(self):
+        from studio.provider import download_to_field, PermanentProviderError
+        item = self.item()
+        response = Mock(); response.status_code = 200
+        response.headers = {'Content-Length': str(250 * 1024 * 1024 + 1)}
+        cm = Mock(); cm.__enter__ = Mock(return_value=response); cm.__exit__ = Mock(return_value=False)
+        with patch('studio.provider.safe_asset_url'), patch('studio.provider.requests.get', return_value=cm):
+            with self.assertRaises(PermanentProviderError):
+                download_to_field(item, 'model_fbx', 'https://assets.meshy.ai/large.fbx', 'large.fbx')
+        response.iter_content.assert_not_called()
+        item.refresh_from_db(); self.assertFalse(item.model_fbx)
+        response.headers = {}; response.iter_content.return_value = [b'a' * 21]
+        with patch('studio.provider.safe_asset_url'), patch('studio.provider.requests.get', return_value=cm):
+            with self.assertRaises(PermanentProviderError):
+                download_to_field(item, 'model_fbx', 'https://assets.meshy.ai/large.fbx', 'large.fbx', max_size=20)
+        item.refresh_from_db(); self.assertFalse(item.model_fbx)
+
+    def test_oversized_result_finishes_request_and_releases_student(self):
+        from studio.provider import PermanentProviderError
+        item = self.item()
+        Request.objects.filter(pk=item.pk).update(status='running', provider_mode='live', provider_task_id='large-model')
+        with patch('studio.tasks.Meshy') as api, patch('studio.tasks.archive_result', side_effect=PermanentProviderError('Файл больше 250 МБ')):
+            api.return_value.poll.return_value = {'status': 'SUCCEEDED'}
+            self.animation_tick(item)
+            self.assertEqual(item.status, 'failed'); self.assertIsNone(item.next_poll_at)
+            self.animation_tick(item)
+            self.assertEqual(api.return_value.poll.call_count, 1)
+            api.return_value.submit.assert_not_called()
+        form = self.make_form(); self.assertTrue(form.is_valid())
+        self.assertEqual(create_request(self.student, form).status, 'pending')
+
+    def test_large_upload_is_rejected_before_request_exists(self):
+        form = self.make_form()
+        form.files['image'] = SimpleUploadedFile('large.jpg', b'0' * (10 * 1024 * 1024 + 1), 'image/jpeg')
+        self.assertFalse(form.is_valid()); self.assertIn('image', form.errors)
+        self.assertEqual(Request.objects.filter(student=self.student).count(), 0)
+        self.assertEqual(self.item().status, 'pending')
+
+    def test_saving_failures_are_bounded_and_can_be_closed_without_new_post(self):
+        from studio.management_services import close_request
+        item = self.item()
+        Request.objects.filter(pk=item.pk).update(status='saving', provider_mode='live', provider_task_id='saved-provider-task', poll_failures=7)
+        with patch('studio.tasks.Meshy') as api:
+            api.return_value.poll.side_effect = ProviderError('temporary')
+            self.animation_tick(item)
+            self.assertEqual(item.status, 'failed'); self.assertIsNone(item.next_poll_at)
+            api.return_value.submit.assert_not_called()
+        Request.objects.filter(pk=item.pk).update(status='saving', lease_until=None)
+        close_request(item.pk, self.teacher)
+        item.refresh_from_db(); self.assertEqual(item.status, 'canceled')
+        self.item()
+
+    def test_pending_request_deletion_is_confirmed_private_and_reversible(self):
+        from studio.management_services import close_request, restore_request
+        item = self.item(); self.client.force_login(self.student)
+        self.assertEqual(self.client.post(reverse('request_delete', args=[item.pk]), {'confirmed':'on'}).status_code, 403)
+        self.client.force_login(self.teacher)
+        self.client.get(reverse('request_delete', args=[item.pk])); item.refresh_from_db()
+        self.assertIsNone(item.deleted_at)
+        self.client.post(reverse('request_delete', args=[item.pk]), {}); item.refresh_from_db()
+        self.assertIsNone(item.deleted_at)
+        self.client.post(reverse('request_delete', args=[item.pk]), {'confirmed':'on'}); item.refresh_from_db()
+        self.assertEqual(item.status, 'canceled'); self.assertIsNotNone(item.deleted_at)
+        self.assertNotContains(self.client.get('/'), '#'+item.short_id)
+        self.assertContains(self.client.get('/?status=trash'), item.title)
+        self.client.force_login(self.student)
+        self.assertEqual(self.client.get(reverse('detail', args=[item.pk])).status_code, 404)
+        self.assertEqual(self.client.get(reverse('file', args=[item.pk, 'image'])).status_code, 404)
+        restore_request(item.pk, self.teacher); item.refresh_from_db()
+        self.assertEqual(item.status, 'canceled'); self.assertIsNone(item.deleted_at)
+        self.assertEqual(self.client.get(reverse('detail', args=[item.pk])).status_code, 200)
+
+    def test_deleting_ready_request_restores_original_files_without_paid_work(self):
+        from studio.management_services import close_request, restore_request
+        item = self.ready_humanoid()
+        close_request(item.pk, self.teacher, hide=True)
+        item.refresh_from_db(); self.assertEqual(item.status, 'ready')
+        restore_request(item.pk, self.teacher)
+        self.client.force_login(self.student)
+        response = self.client.get(reverse('file', args=[item.pk, 'fbx']))
+        self.assertEqual(response.status_code, 200); self.assertTrue(b''.join(response.streaming_content))
+
+    def test_deleting_running_request_keeps_slot_until_provider_terminal(self):
+        from studio.management_services import close_request
+        item = self.item()
+        Request.objects.filter(pk=item.pk).update(status='running', provider_mode='live', provider_task_id='still-running')
+        close_request(item.pk, self.teacher, hide=True)
+        item.refresh_from_db(); self.assertEqual(item.status, 'running')
+        form = self.make_form(); self.assertTrue(form.is_valid())
+        with self.assertRaises(ValidationError): create_request(self.student, form)
+        with patch('studio.tasks.Meshy') as api, patch('studio.tasks.archive_result') as archive:
+            api.return_value.poll.return_value = {'status':'IN_PROGRESS','progress':30}
+            self.animation_tick(item); self.assertEqual(item.status, 'running')
+            api.return_value.poll.return_value = {'status':'SUCCEEDED'}
+            self.animation_tick(item); self.assertEqual(item.status, 'canceled')
+            archive.assert_not_called(); api.return_value.submit.assert_not_called()
+        self.assertIsNotNone(item.deleted_at)
+        self.assertEqual(create_request(self.student, form).status, 'pending')
+
+    def test_deletion_during_post_does_not_lose_flag_or_task_id(self):
+        from studio.management_services import close_request
+        item = self.approve(self.item())
+        with override_settings(MESHY_MODE='live'), patch('studio.tasks.Meshy') as api:
+            def posted(target):
+                close_request(target.pk, self.teacher, hide=True)
+                return 'post-already-accepted'
+            api.return_value.submit.side_effect = posted
+            self.animation_tick(item)
+        self.assertEqual((item.status, item.provider_task_id), ('running','post-already-accepted'))
+        self.assertTrue(item.cancel_requested); self.assertIsNotNone(item.deleted_at)
+
+    def test_closure_during_file_download_is_not_overwritten_by_file_saves(self):
+        from studio.management_services import close_request
+        item = self.item()
+        Request.objects.filter(pk=item.pk).update(status='running',provider_mode='live',provider_task_id='finished-task')
+        response=Mock(); response.status_code=200; response.headers={}; response.iter_content.return_value=[b'valid-fixture']
+        cm=Mock(); cm.__enter__=Mock(return_value=response); cm.__exit__=Mock(return_value=False)
+        def downloading(*args, **kwargs):
+            close_request(item.pk, self.teacher, hide=True)
+            return cm
+        with patch('studio.tasks.Meshy') as api, patch('studio.provider.safe_asset_url'), patch('studio.provider.requests.get',side_effect=downloading):
+            api.return_value.poll.return_value={'status':'SUCCEEDED','model_urls':{'glb':'https://assets.meshy.ai/a','fbx':'https://assets.meshy.ai/b'}}
+            self.animation_tick(item)
+        self.assertEqual(item.status,'canceled'); self.assertTrue(item.cancel_requested); self.assertIsNotNone(item.deleted_at)
+
+    def test_student_edit_changes_only_allowed_fields_and_optional_password(self):
+        self.client.force_login(self.teacher)
+        old_hash=self.student.password
+        url=reverse('student_edit',args=[self.student.pk])
+        self.assertEqual(self.client.post(url,{'username':'new-student','first_name':'Новое имя','is_active':'on','password':''}).status_code,302)
+        self.student.refresh_from_db()
+        self.assertEqual((self.student.username,self.student.first_name),('new-student','Новое имя'))
+        self.assertEqual(self.student.password,old_hash)
+        self.client.post(url,{'username':'new-student','first_name':'Новое имя','password':'New-classroom-3749!','is_staff':'on','is_superuser':'on'})
+        self.student.refresh_from_db()
+        self.assertTrue(self.student.check_password('New-classroom-3749!'))
+        self.assertFalse(self.student.is_active); self.assertFalse(self.student.is_staff); self.assertFalse(self.student.is_superuser)
+        self.assertEqual(self.client.get(reverse('student_edit',args=[self.teacher.pk])).status_code,404)
+        self.assertEqual(self.client.get(reverse('student_delete',args=[self.teacher.pk])).status_code,404)
+
+    def test_student_edit_rejects_duplicate_username_and_weak_password(self):
+        self.client.force_login(self.teacher)
+        url=reverse('student_edit',args=[self.student.pk])
+        response=self.client.post(url,{'username':'other','first_name':'Student','is_active':'on','password':'12345678'})
+        self.assertEqual(response.status_code,200)
+        self.assertIn('username',response.context['form'].errors); self.assertIn('password',response.context['form'].errors)
+        self.student.refresh_from_db(); self.assertEqual(self.student.username,'student')
+
+    def test_delete_student_blocks_login_and_preserves_history_and_active_accounting(self):
+        from studio.management_services import delete_student
+        from studio.models import StudentRecord
+        item=self.item()
+        self.client.force_login(self.student)
+        delete_student(self.student.pk,self.teacher)
+        self.student.refresh_from_db(); item.refresh_from_db()
+        self.assertFalse(self.student.is_active); self.assertFalse(self.student.has_usable_password())
+        self.assertIsNotNone(StudentRecord.objects.get(user=self.student).deleted_at)
+        self.assertEqual(item.status,'canceled'); self.assertEqual(item.student_id,self.student.pk)
+        self.assertEqual(self.client.get('/').status_code,302)
+        self.client.force_login(self.teacher)
+        self.assertNotContains(self.client.get('/students/'),'href="'+reverse('student_edit',args=[self.student.pk])+'"')
+        self.assertContains(self.client.get(reverse('detail',args=[item.pk])),item.title)
+
+    def test_management_mutations_require_teacher_and_csrf(self):
+        item=self.item(); self.client.force_login(self.student)
+        for name,pk in [('student_edit',self.other.pk),('student_delete',self.other.pk),('request_delete',item.pk),('request_close',item.pk),('request_restore',item.pk),('recover_tasks',item.pk)]:
+            self.assertEqual(self.client.post(reverse(name,args=[pk]),{'confirmed':'on'}).status_code,403)
+        client=Client(enforce_csrf_checks=True); client.force_login(self.teacher)
+        for name,pk in [('student_delete',self.student.pk),('request_delete',item.pk),('request_close',item.pk),('request_restore',item.pk)]:
+            self.assertEqual(client.post(reverse(name,args=[pk]),{'confirmed':'on'}).status_code,403)
+        self.student.refresh_from_db(); item.refresh_from_db()
+        self.assertTrue(self.student.is_active); self.assertIsNone(item.deleted_at)
+
+    def test_recovery_page_lists_provider_tasks_without_new_paid_submission(self):
+        item=self.item(); Request.objects.filter(pk=item.pk).update(status='uncertain',provider_mode='live')
+        self.client.force_login(self.teacher)
+        with patch('studio.provider.Meshy.list_tasks',return_value=[{'id':'task-to-choose','created_at':1795600000000,'status':'SUCCEEDED'}]) as listing:
+            response=self.client.get(reverse('recover_tasks',args=[item.pk]))
+        self.assertContains(response,'task-to-choose'); self.assertContains(response,'name="task_id"')
+        self.assertEqual(listing.call_count,1)
+        with patch('studio.provider.Meshy.poll',return_value={'status':'SUCCEEDED'}) as poll:
+            self.client.post(reverse('reconcile',args=[item.pk]),{'task_id':'task-to-choose','confirmed':'on'})
+        item.refresh_from_db(); self.assertEqual((item.status,item.provider_task_id,item.model_task_id),('running','task-to-choose','task-to-choose'))
+        poll.assert_called_once()
+
+    def test_recovery_cannot_bind_another_projects_original_model_id(self):
+        item=self.item(); other=self.item(self.other)
+        Request.objects.filter(pk=item.pk).update(status='uncertain',provider_mode='live')
+        Request.objects.filter(pk=other.pk).update(model_task_id='already-owned-model')
+        self.client.force_login(self.teacher)
+        with patch('studio.provider.Meshy.poll',return_value={'status':'SUCCEEDED'}):
+            self.client.post(reverse('reconcile',args=[item.pk]),{'task_id':'already-owned-model','confirmed':'on'})
+        item.refresh_from_db(); self.assertEqual(item.status,'uncertain'); self.assertIsNone(item.provider_task_id)
+
+    def test_listing_provider_tasks_is_read_only_and_handles_invalid_ids(self):
+        item=self.item(); api=Meshy(); api.session=Mock()
+        api.session.get.return_value.status_code=200
+        api.session.get.return_value.json.return_value={'result':[{'id':'recoverable-id','status':'PENDING'},{'id':'../unsafe'}]}
+        self.assertEqual(api.list_tasks(item,page=2),[{'id':'recoverable-id','status':'PENDING'}])
+        self.assertEqual(api.session.get.call_args.kwargs['params'],{'page_num':2,'page_size':50})
+        self.assertFalse(api.session.get.call_args.kwargs['allow_redirects'])
+        api.session.post.assert_not_called()
+
+    def test_expired_completed_task_is_terminal_not_endless_retry(self):
+        from studio.provider import PermanentProviderError
+        item=self.item(); item.status='saving'; item.provider_task_id='expired-model'
+        api=Meshy(); api.session=Mock(); api.session.get.return_value.status_code=404
+        with self.assertRaises(PermanentProviderError): api.poll(item)
+
+    def test_paid_task_id_survives_audit_failure(self):
+        item=self.approve(self.item())
+        with override_settings(MESHY_MODE='live'), patch('studio.tasks.Meshy') as api, patch('studio.tasks.event',side_effect=RuntimeError('audit temporarily unavailable')):
+            api.return_value.submit.return_value='accepted-before-audit'
+            self.animation_tick(item)
+            api.return_value.submit.assert_called_once()
+        self.assertEqual((item.status,item.provider_task_id),('running','accepted-before-audit'))
+
+    def test_deleted_or_disabled_student_cannot_submit_using_cached_authenticated_user(self):
+        from studio.animations import request_animation
+        item=self.ready_humanoid()
+        get_user_model().objects.filter(pk=self.student.pk).update(is_active=False)
+        self.assertTrue(self.student.is_active)  # In-flight request still holds the old User object.
+        form=self.make_form(); self.assertTrue(form.is_valid())
+        with self.assertRaises(ValidationError): create_request(self.student,form)
+        with self.assertRaises(ValidationError): request_animation(item.pk,self.student,['walk'])
+        item.refresh_from_db(); self.assertEqual(item.status,'ready')

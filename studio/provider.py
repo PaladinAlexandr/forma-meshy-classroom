@@ -3,6 +3,7 @@ import base64
 import io
 import ipaddress
 import json
+import re
 import socket
 import struct
 import tempfile
@@ -18,6 +19,24 @@ class ProviderError(Exception):
 
 class SubmissionUncertain(ProviderError):
     pass
+
+
+class PermanentProviderError(ProviderError):
+    """A definitive rejection or an asset which cannot be archived by retrying."""
+    pass
+
+
+def safe_message(value, limit=350):
+    text = str(value or '')
+    if settings.MESHY_API_KEY:
+        text = text.replace(settings.MESHY_API_KEY, '[скрыто]')
+    text = re.sub(r'https?://\S+|data:[^\s]+|Bearer\s+\S+', '[адрес или ключ скрыт]', text, flags=re.I)
+    return ' '.join(text.split())[:limit]
+
+
+def task_id(value):
+    # Opaque ID, encoded as a path segment by the caller. Never interpret it as a URL.
+    return isinstance(value, str) and 1 <= len(value) <= 100 and not any(ord(c) < 33 or c in '/\\?#' for c in value)
 
 
 class Meshy:
@@ -64,20 +83,28 @@ class Meshy:
             response = self.session.post(url, json=payload, timeout=(10, 90), allow_redirects=False)
         except requests.RequestException as exc:
             raise SubmissionUncertain('Связь прервалась при отправке. Проверьте задачи Meshy перед любым повтором.') from exc
-        if response.status_code >= 500 or response.status_code in (408, 409):
+        if response.status_code >= 500 or response.status_code == 408:
             raise SubmissionUncertain('Meshy не подтвердил отправку. Требуется сверка задач в аккаунте.')
-        if response.status_code != 200 and response.status_code != 201:
+        # Creating a task normally returns 202 Accepted, not only 200/201.
+        if not 200 <= response.status_code < 300:
             messages = {401: 'API-ключ Meshy отклонён.', 402: 'В аккаунте Meshy недостаточно кредитов.',
                         429: 'Meshy отклонил отправку: превышен лимит частоты.',
                         400: 'Meshy отклонил параметры или изображение.', 422: 'Meshy отклонил параметры или изображение.'}
             if 400 <= response.status_code < 500:
-                raise ProviderError(messages.get(response.status_code, f'Meshy отклонил запрос (HTTP {response.status_code}).'))
-            raise SubmissionUncertain('Неожиданный ответ Meshy. Требуется проверка отправки.')
+                detail = ''
+                try:
+                    body = response.json()
+                    detail = safe_message(body.get('message', '')) if isinstance(body, dict) else ''
+                except (ValueError, TypeError):
+                    pass
+                label = 'Слишком большой файл.' if response.status_code == 413 else messages.get(response.status_code, 'Meshy отклонил запрос.')
+                raise PermanentProviderError(f'{label} HTTP {response.status_code}.' + (f' Meshy: {detail}' if detail else ''))
+            raise SubmissionUncertain(f'Не удалось подтвердить создание задачи (HTTP {response.status_code}). Повторная отправка заблокирована до сверки.')
         try:
-            task_id = response.json()['result']
-            if not isinstance(task_id, str) or not task_id or len(task_id) > 100:
+            identifier = response.json()['result']
+            if not task_id(identifier):
                 raise ValueError()
-            return task_id
+            return identifier
         except (ValueError, KeyError, TypeError) as exc:
             raise SubmissionUncertain('Meshy принял запрос, но ID задачи не удалось прочитать.') from exc
 
@@ -86,8 +113,15 @@ class Meshy:
         return 'https://api.meshy.ai/openapi/v1/' + endpoints[item.generation_stage]
 
     def poll(self, item):
+        from urllib.parse import quote
+        if not task_id(item.provider_task_id):
+            raise PermanentProviderError('Некорректный ID задачи Meshy.')
         try:
-            response = self.session.get(f'{self.task_url(item)}/{item.provider_task_id}', timeout=(10, 30), allow_redirects=False)
+            response = self.session.get(f'{self.task_url(item)}/{quote(item.provider_task_id, safe="")}', timeout=(10, 30), allow_redirects=False)
+            if response.status_code in (404, 410) and item.status == 'saving':
+                raise PermanentProviderError('Готовая задача Meshy больше недоступна. Сохранение завершено ошибкой; можно создать новую заявку.')
+            if response.status_code >= 400:
+                raise ProviderError(f'Не удалось проверить Meshy (HTTP {response.status_code}). Повторим проверку; преподавателю доступна сверка задачи.')
             response.raise_for_status()
             result = response.json()
             if result.get('status') not in ('PENDING', 'IN_PROGRESS', 'SUCCEEDED', 'FAILED', 'CANCELED'):
@@ -95,6 +129,20 @@ class Meshy:
             return result
         except (requests.RequestException, ValueError, TypeError) as exc:
             raise ProviderError('Не удалось проверить состояние Meshy. Проверка будет повторена автоматически.') from exc
+
+    def list_tasks(self, item, page=1):
+        """Read-only recovery. A teacher chooses a task; timestamps never auto-bind it."""
+        try:
+            response = self.session.get(self.task_url(item), params={'page_num': page, 'page_size': 50},
+                timeout=(10, 30), allow_redirects=False)
+            response.raise_for_status()
+            body = response.json()
+            records = body if isinstance(body, list) else body.get('result', [])
+            if not isinstance(records, list):
+                raise ValueError()
+            return [row for row in records[:50] if isinstance(row, dict) and task_id(row.get('id'))]
+        except (requests.RequestException, ValueError, TypeError, AttributeError) as exc:
+            raise ProviderError('Не удалось загрузить список задач Meshy. Проверьте подключение и API-ключ.') from exc
 
 
 def safe_asset_url(url):
@@ -118,19 +166,28 @@ def download_to_field(item, field_name, url, filename, max_size=250 * 1024 * 102
     try:
         with requests.get(url, timeout=(10, 90), stream=True, allow_redirects=False) as response:
             if response.status_code != 200:
+                if response.status_code in (404, 410, 413):
+                    raise PermanentProviderError(f'Файл Meshy недоступен или слишком большой (HTTP {response.status_code}). Преподаватель может закрыть заявку.')
                 raise ProviderError('Не удалось сохранить файл модели. Загрузка будет повторена.')
+            try:
+                size_hint = int(response.headers.get('Content-Length', 0))
+            except (TypeError, ValueError):
+                size_hint = 0
+            if size_hint > max_size:
+                raise PermanentProviderError(f'Файл превышает лимит сохранения {max_size // (1024 * 1024)} МБ. Заявка завершена; можно создать новую.')
             with tempfile.TemporaryFile() as tmp:
                 size = 0
                 for chunk in response.iter_content(128 * 1024):
                     size += len(chunk)
                     if size > max_size:
-                        raise ProviderError('Файл модели превышает лимит сохранения.')
+                        raise PermanentProviderError(f'Файл превышает лимит сохранения {max_size // (1024 * 1024)} МБ. Можно создать новую заявку.')
                     tmp.write(chunk)
                 if not size:
                     raise ProviderError('Meshy вернул пустой файл.')
                 tmp.seek(0)
                 field = getattr(item, field_name)
-                field.save(filename, File(tmp), save=True)
+                field.save(filename, File(tmp), save=False)
+                item.save(update_fields=[field_name])
     except requests.RequestException as exc:
         raise ProviderError('Ошибка загрузки модели. Попытка будет повторена автоматически.') from exc
 
@@ -169,11 +226,13 @@ def archive_image(item, result):
                 image.thumbnail((2048, 2048))
                 out = io.BytesIO()
                 image.save(out, 'JPEG', quality=92)
-        item.image.save('generated.jpg', ContentFile(out.getvalue()), save=True)
+        item.image.save('generated.jpg', ContentFile(out.getvalue()), save=False)
+        item.save(update_fields=['image'])
     except (OSError, ValueError, Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
         # Remove an invalid download so a later poll can fetch a corrected provider result.
-        item.image.delete(save=True)
-        raise ProviderError('Не удалось сохранить изображение Meshy. Проверка будет повторена.') from exc
+        item.image.delete(save=False)
+        item.save(update_fields=['image'])
+        raise PermanentProviderError('Изображение Meshy повреждено или превышает допустимый размер. Можно создать новую заявку.') from exc
 
 
 def demo_image():

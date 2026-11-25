@@ -53,6 +53,7 @@ class Request(models.Model):
         FAILED = 'failed', 'Ошибка генерации'
         UNCERTAIN = 'uncertain', 'Нужна проверка отправки'
         IMAGE_READY = 'image_ready', 'Выбери: создавать модель?'
+        CANCELED = 'canceled', 'Заявка закрыта'
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     student = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='model_requests')
@@ -99,6 +100,8 @@ class Request(models.Model):
     next_poll_at = models.DateTimeField(null=True, blank=True)
     lease_until = models.DateTimeField(null=True, blank=True)
     poll_failures = models.PositiveIntegerField(default=0)
+    deleted_at = models.DateTimeField(null=True, blank=True)
+    cancel_requested = models.BooleanField(default=False)
 
     class Meta:
         ordering = ['-created_at']
@@ -171,3 +174,8 @@ class AnimationAsset(models.Model):
 
     class Meta:
         ordering = ['-created_at']
+
+
+class StudentRecord(models.Model):
+    user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='student_record')
+    deleted_at = models.DateTimeField(null=True, blank=True)

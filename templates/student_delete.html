@@ -1,0 +1,5 @@
+{% extends 'base.html' %}{% block title %}Удалить ученика{% endblock %}{% block crumb %}Ученики{% endblock %}{% block content %}
+<a class="back" href="{% url 'students' %}">← К ученикам</a><section class="panel management-form"><h1>Удалить ученика?</h1>
+<p><strong>{{ student.first_name|default:student.username }}</strong> · {{ student.username }}</p>
+<p>Ученик исчезнет из списка и потеряет доступ к кабинету. История заявок и моделей сохранится у преподавателя. Новые этапы его генераций запускаться не будут; уже отправленные задачи отслеживаются до завершения.</p>
+<form method="post" class="stack">{% csrf_token %}<label class="consent"><input type="checkbox" name="confirmed" required><span>Удалить этого ученика из списка и закрыть вход.</span></label><button class="btn danger">Удалить ученика</button></form></section>{% endblock %}

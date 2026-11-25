@@ -1,0 +1,5 @@
+{% if item.cancel_requested and item.status != 'canceled' %}<section class="panel"><h2>Завершаем обработку</h2><p>Преподаватель запросил закрытие заявки. Новые этапы не запускаются; уже отправленная генерация отслеживается до завершения.</p></section>{% endif %}
+{% if teacher %}<section class="panel request-controls"><h2>Управление заявкой</h2>
+{% if item.deleted_at %}<p>Заявка в корзине. Файлы и история сохранены.</p><form method="post" action="{% url 'request_restore' item.pk %}">{% csrf_token %}<button class="btn secondary full">Восстановить заявку</button></form>
+{% else %}{% if can_close %}<a class="btn secondary full" href="{% url 'request_close' item.pk %}">Завершить обработку</a>{% endif %}<a class="btn danger full" href="{% url 'request_delete' item.pk %}">Удалить заявку</a>{% endif %}
+</section>{% endif %}

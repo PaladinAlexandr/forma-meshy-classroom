@@ -3,13 +3,13 @@ from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
-from .access import is_teacher
+from .access import is_teacher, lock_active_student
 from .models import Request, Event, Policy, UNFINISHED_STATUSES
 
 
 @transaction.atomic
 def create_request(student, form):
-    get_user_model().objects.select_for_update().get(pk=student.pk)
+    lock_active_student(student)
     if Request.objects.filter(student=student, status__in=UNFINISHED_STATUSES).exists():
         raise ValidationError('У тебя уже есть незавершённый проект. Дождись результата или решения преподавателя, прежде чем отправлять новую заявку.')
     policy = Policy.objects.get(pk=1)
@@ -73,6 +73,7 @@ def monthly_usage(month):
 
 @transaction.atomic
 def choose_generated_image(item_id, student, accept):
+    lock_active_student(student)
     item = Request.objects.select_for_update().get(pk=item_id, student=student)
     if item.status != 'image_ready' or not item.image or item.generation_stage != 'image':
         raise ValidationError('Изображение уже обработано или ещё не готово.')

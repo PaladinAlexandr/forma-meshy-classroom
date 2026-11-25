@@ -8,7 +8,7 @@ from django.core.exceptions import ValidationError
 from django.core.files import File
 from django.db import transaction
 from django.utils import timezone
-from .access import is_teacher
+from .access import is_teacher, lock_active_student
 from .models import AnimationAsset, Event, Request, UNFINISHED_STATUSES
 from .provider import ProviderError, download_to_field
 
@@ -34,11 +34,11 @@ class AnimationForm(forms.Form):
 
 @transaction.atomic
 def request_animation(pk, student, actions):
-    get_user_model().objects.select_for_update().get(pk=student.pk)
+    lock_active_student(student)
     item = Request.objects.select_for_update().get(pk=pk, student=student)
-    if is_teacher(student) or item.model_kind != 'humanoid':
+    if is_teacher(student) or item.model_kind != 'humanoid' or item.deleted_at:
         raise ValidationError('Анимация доступна только ученику для его гуманоидной модели.')
-    if (item.status != 'ready' and not (item.is_animation and item.status in ('failed', 'rejected'))
+    if (item.status != 'ready' and not (item.is_animation and item.status in ('failed', 'rejected', 'canceled'))
             or not item.model_fbx or not item.model_glb):
         raise ValidationError('Сначала дождись готовой 3D-модели и завершения текущего этапа.')
     if Request.objects.filter(student=student, status__in=UNFINISHED_STATUSES).exists():
@@ -54,6 +54,7 @@ def request_animation(pk, student, actions):
     item.animation_actions = actions
     item.generation_stage = 'animation' if item.rig_task_id and item.rigged_fbx else 'rig'
     item.status, item.progress = 'pending', 0
+    item.cancel_requested = False
     item.provider_task_id = None
     item.review_note, item.error = '', ''
     item.reviewer, item.reviewed_at = None, None

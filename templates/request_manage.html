@@ -1,0 +1,9 @@
+{% extends 'base.html' %}{% block title %}Управление заявкой{% endblock %}{% block content %}
+<a class="back" href="{% url 'detail' item.pk %}">← К заявке</a><section class="panel management-form">
+<h1>{% if operation == 'delete' %}Удалить заявку?{% else %}Завершить обработку?{% endif %}</h1>
+<p><strong>{{ item.title }}</strong> · {{ item.student.first_name|default:item.student.username }} · {{ item.status_label }}</p>
+{% if operation == 'delete' %}<p>Заявка попадёт в корзину преподавателя и исчезнет у ученика. Её можно восстановить; сохранённые файлы останутся в хранилище.</p>{% endif %}
+{% if provider_active %}<p class="info-line">Генерация уже отправлена или её отправка требует проверки. Дождёмся завершения Meshy, прежде чем освобождать место ученика. Новые платные этапы запускаться не будут. Для неизвестной отправки сначала выберите существующую задачу в блоке «Сверка с Meshy».</p>
+{% else %}<p>Обработка незавершённой заявки будет закрыта, ученик сможет создать новую. Готовые результаты при удалении сохраняются в корзине.</p>{% endif %}
+<form method="post" class="stack">{% csrf_token %}<label class="consent"><input type="checkbox" name="confirmed" required><span>Подтверждаю действие с этой заявкой.</span></label><button class="btn danger">{% if operation == 'delete' %}Переместить в корзину{% else %}Завершить обработку{% endif %}</button></form>
+</section>{% endblock %}

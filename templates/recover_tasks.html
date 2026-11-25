@@ -1,0 +1,9 @@
+{% extends 'base.html' %}{% block title %}Найти задачу Meshy{% endblock %}{% block content %}
+<a class="back" href="{% url 'detail' item.pk %}">← К заявке</a><section class="panel management-form"><h1>Задачи Meshy</h1>
+<p>{{ item.title }} · этап: {{ item.get_generation_stage_display }}. Отправка: {{ item.submitted_at|date:'d.m.Y H:i:s' }}.</p>
+<p>Выберите задачу этого проекта по времени и этапу. Привязка продолжит проверку существующей задачи, без повторной платной отправки.</p>
+{% if tasks %}<form method="post" action="{% url 'reconcile' item.pk %}" class="stack">{% csrf_token %}<fieldset class="recovery-options"><legend>Последние задачи этого этапа</legend>
+{% for task in tasks %}<label class="task-choice"><input type="radio" name="task_id" value="{{ task.id }}" required><span><strong>{{ task.created|date:'d.m.Y H:i:s' }}</strong> · {{ task.status }}<code>{{ task.id }}</code></span></label>{% endfor %}</fieldset>
+<label class="consent"><input type="checkbox" name="confirmed" required><span>Это задача выбранного проекта: время, этап и исходная модель совпадают.</span></label><button class="btn primary">Привязать и проверить результат</button></form>
+{% else %}<p>Подходящие задачи не найдены. Проверьте API-ключ и текущий этап. При необходимости используйте ручную сверку на странице проекта.</p>{% endif %}
+<nav class="pagination">{% if previous_page %}<a href="?page={{ previous_page }}">← Более новые</a>{% endif %}{% if next_page %}<a href="?page={{ next_page }}">Более старые →</a>{% endif %}</nav></section>{% endblock %}
